@@ -1,0 +1,31 @@
+# Python virtual environments
+.venv/
+.venv_old/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Database files (Render will create its own)
+*.db
+*.db.bak
+*.sqlite
+*.sqlite3
+instance/
+
+# HTML captures / temp files
+page.html
+page2.html
+page3.html
+running_page.html
+test_page.html
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
