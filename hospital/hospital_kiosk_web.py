@@ -1,63 +1,83 @@
-# Save this complete file as hospital_kiosk_enhanced.py
-from flask import Flask, render_template_string, request, jsonify, session, flash, redirect, url_for
+from flask import Flask, request, jsonify, flash, redirect, url_for
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+from sqlalchemy import text
 import datetime
+import html
 import uuid
 import json
 import os
 import base64
 import io
+import math
+import sqlite3
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 from PIL import Image
 import numpy as np
-from scipy import ndimage
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
+from sqlalchemy.pool import StaticPool
 
-# Try to import face recognition libraries in order of preference
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
+if load_dotenv is not None:
+    load_dotenv()
+
+# Face AI stack – availability flags (all start False)
 DEEPFACE_AVAILABLE = False
 FACENET_AVAILABLE = False
 OPENCV_AVAILABLE = False
-FACE_RECOGNITION_AVAILABLE = False
-SKLEARN_AVAILABLE = False
+TORCH_AVAILABLE = False
 
-# Ensure cv2 is always defined to avoid NameError when unavailable
+# Ensure optional globals always exist so the rest of the file never NameErrors
 cv2 = None
 FACE_CASCADE = None
+EYE_CASCADE = None
+torch = None
+DeepFace = None
+MTCNN = None
+MTCNN_DETECTOR = None
+FACENET_MODEL = None
+FACENET_DEVICE = None
 
-# Try face_recognition library (uses dlib ResNet)
+# ─── Matching constants (NIST-recommended for FaceNet-VGGFace2 512-D) ──────────
+FACE_EMBEDDING_DIM       = 512
+FACENET_IMAGE_SIZE       = 160
+# Cosine-similarity thresholds (higher = stricter)
+FACE_MATCH_EXCELLENT_THRESHOLD = 0.80   # near-perfect match
+DEFAULT_COSINE_THRESHOLD       = 0.68   # standard match gate
+DEFAULT_SIMILARITY_GAP         = 0.04   # min gap vs 2nd-best
+# Euclidean distance thresholds (L2-norm of unit vectors, max √2 ≈ 1.414)
+DEFAULT_EUCLIDEAN_THRESHOLD    = 0.85   # tighter for FaceNet 512-D unit vecs
+IMAGE_RESAMPLING = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+
+
+def cosine_to_euclidean_threshold(cosine_threshold):
+    """Convert cosine-similarity threshold to L2-distance threshold for unit vectors."""
+    return float(math.sqrt(max(0.0, 2.0 - (2.0 * cosine_threshold))))
+
+
 try:
-    import face_recognition as fr
-    FACE_RECOGNITION_AVAILABLE = True
-    print("[+] face_recognition library available (dlib-based)")
+    import torch
+    TORCH_AVAILABLE = True
+    print("[+] PyTorch available")
 except ImportError:
-    print("[!] face_recognition library not available")
+    print("[!] PyTorch not available")
 
-# Try scikit-learn for classifier training
-try:
-    from sklearn.svm import SVC
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.metrics import accuracy_score, classification_report
-    from sklearn.model_selection import train_test_split
-    SKLEARN_AVAILABLE = True
-    print("[+] scikit-learn available for model training")
-except ImportError:
-    print("[!] scikit-learn not available")
-
-# Try OpenCV first (most reliable and doesn't require external models)
 try:
     import cv2
     OPENCV_AVAILABLE = True
-    # Load Haar Cascade classifier for face detection
     cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
     FACE_CASCADE = cv2.CascadeClassifier(cascade_path)
-    
-    # Load Eye Cascade for high-accuracy alignment
     eye_cascade_path = cv2.data.haarcascades + 'haarcascade_eye.xml'
     EYE_CASCADE = cv2.CascadeClassifier(eye_cascade_path)
 
     if not FACE_CASCADE.empty():
-        print("[+] OpenCV available with Face and Eye Cascades for high-accuracy alignment")
+        print("[+] OpenCV available with Face and Eye Cascades for fallback detection")
     else:
         OPENCV_AVAILABLE = False
         print("[!] OpenCV Haar Cascade failed to load")
@@ -67,34 +87,88 @@ except ImportError:
 try:
     from deepface import DeepFace
     DEEPFACE_AVAILABLE = True
-    print("[+] DeepFace available for face recognition")
+    print("[+] DeepFace available (face detection + recognition backend)")
 except ImportError:
-    print("[!] DeepFace not available")
+    print("[!] DeepFace not installed – pip install deepface")
 
-# Try FaceNet (best option)
 try:
-    from facenet_pytorch import InceptionResnetV1
-    import torch
+    from facenet_pytorch import InceptionResnetV1, MTCNN
     FACENET_AVAILABLE = True
-    print("[+] FaceNet (facenet-pytorch) available for face recognition")
-    # Initialize FaceNet model
+    print("[+] facenet-pytorch available")
     try:
-        FACENET_MODEL = InceptionResnetV1(pretrained='vggface2').eval()
-        if torch.cuda.is_available():
-            FACENET_MODEL = FACENET_MODEL.cuda()
-            print("[+] FaceNet GPU acceleration enabled")
-        print("[+] FaceNet model loaded successfully")
-    except Exception as e:
-        print(f"[!] Failed to load FaceNet model: {e}")
+        FACENET_DEVICE = torch.device("cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu")
+        FACENET_MODEL = InceptionResnetV1(pretrained='vggface2').eval().to(FACENET_DEVICE)
+        MTCNN_DETECTOR = MTCNN(
+            image_size=FACENET_IMAGE_SIZE,
+            margin=20,          # slightly wider crop for better alignment
+            keep_all=False,     # only the largest / most confident face
+            post_process=True,  # return normalised tensor ready for FaceNet
+            select_largest=True,
+            device=FACENET_DEVICE
+        )
+        if TORCH_AVAILABLE and torch.cuda.is_available():
+            print("[+] FaceNet running on GPU")
+        else:
+            print("[+] FaceNet running on CPU")
+        print("[+] FaceNet InceptionResNetV1 (VGGFace2) + MTCNN detector loaded")
+    except Exception as _e:
+        print(f"[!] FaceNet model load failed: {_e}")
         FACENET_AVAILABLE = False
         FACENET_MODEL = None
+        MTCNN_DETECTOR = None
+        FACENET_DEVICE = None
 except ImportError:
-    print("[!] FaceNet (facenet-pytorch) not available")
+    print("[!] facenet-pytorch not installed – pip install facenet-pytorch")
+
 
 # Initialize Flask App
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'hospital-kiosk-secret-key-2024'
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///hospital_kiosk.db'
+
+
+def _resolve_database_uri():
+    """Pick a SQLite location that is writable in the current environment."""
+    def _can_write_sqlite(db_file):
+        probe = sqlite3.connect(db_file, timeout=2)
+        try:
+            probe.execute('BEGIN IMMEDIATE')
+            probe.execute('CREATE TABLE IF NOT EXISTS __codex_write_probe__(id INTEGER)')
+            probe.execute('INSERT INTO __codex_write_probe__ DEFAULT VALUES')
+            probe.rollback()
+            return True
+        finally:
+            probe.close()
+
+    configured_path = os.environ.get('HOSPITAL_KIOSK_DB_PATH')
+    if configured_path:
+        db_file = os.path.abspath(configured_path)
+        os.makedirs(os.path.dirname(db_file) or '.', exist_ok=True)
+        try:
+            if _can_write_sqlite(db_file):
+                return f"sqlite:///{db_file.replace('\\', '/')}", db_file, False
+            print(f"[!] SQLite file database unavailable at {db_file}: write probe failed")
+        except Exception as exc:
+            print(f"[!] SQLite write probe failed for {db_file}: {exc}")
+
+    legacy_db_path = os.path.abspath(os.path.join(app.root_path, 'instance', 'hospital_kiosk.db'))
+    try:
+        os.makedirs(os.path.dirname(legacy_db_path) or '.', exist_ok=True)
+        if _can_write_sqlite(legacy_db_path):
+            return f"sqlite:///{legacy_db_path.replace('\\', '/')}", legacy_db_path, False
+        print(f"[!] SQLite file database unavailable at {legacy_db_path}: write probe failed")
+    except Exception as exc:
+        print(f"[!] SQLite file database unavailable at {legacy_db_path}: {exc}")
+
+    print("[!] Falling back to in-memory SQLite for this session")
+    app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+        'connect_args': {'check_same_thread': False},
+        'poolclass': StaticPool,
+    }
+    return 'sqlite://', None, True
+
+
+db_uri, db_path, USING_IN_MEMORY_DB = _resolve_database_uri()
+app.config['SQLALCHEMY_DATABASE_URI'] = db_uri
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
@@ -136,6 +210,8 @@ class Patient(db.Model):
     aadhaar_number = db.Column(db.String(20))  # Optional Aadhaar number
     department = db.Column(db.String(50), nullable=False)
     consultation_type = db.Column(db.String(20), nullable=False)
+    consultation_date = db.Column(db.Date)
+    consultation_time = db.Column(db.Time)
     queue_number = db.Column(db.String(20))
     check_in_time = db.Column(db.DateTime, default=datetime.datetime.utcnow)
     status = db.Column(db.String(20), default='waiting')
@@ -198,362 +274,499 @@ class FaceRecognitionModel(db.Model):
     false_negatives = db.Column(db.Integer, default=0)
     training_data = db.Column(db.Text)  # JSON with training statistics
 
+
+def parse_consultation_date(value):
+    """Parse the consultation date submitted from the registration form."""
+    return datetime.datetime.strptime(value, '%Y-%m-%d').date()
+
+
+def format_consultation_date(value):
+    """Return a human-friendly consultation date."""
+    if not value:
+        return 'Not scheduled'
+    return value.strftime('%d %b %Y')
+
+
+def format_consultation_time(value):
+    """Return a human-friendly consultation time."""
+    if not value:
+        return 'Not scheduled'
+    return value.strftime('%I:%M %p')
+
+
+def get_consultation_slot_minutes():
+    """Average consultation duration used for queue-based time prediction."""
+    try:
+        return max(5, int(os.environ.get('CONSULTATION_SLOT_MINUTES', '15')))
+    except ValueError:
+        return 15
+
+
+def get_opd_start_time():
+    """Start time used when scheduling future consultations."""
+    raw = os.environ.get('OPD_START_TIME', '09:00').strip()
+    try:
+        return datetime.datetime.strptime(raw, '%H:%M').time()
+    except ValueError:
+        return datetime.time(9, 0)
+
+
+def estimate_consultation_slot(department, consultation_date):
+    """Predict consultation time from the active queue for a department and day."""
+    active_statuses = ['scheduled', 'waiting', 'emergency', 'in_progress']
+    patients_ahead = Patient.query.filter(
+        Patient.department == department,
+        Patient.consultation_date == consultation_date,
+        Patient.status.in_(active_statuses)
+    ).count()
+
+    slot_minutes = get_consultation_slot_minutes()
+    base_dt = datetime.datetime.combine(consultation_date, get_opd_start_time())
+
+    if consultation_date == datetime.date.today():
+        immediate_start = datetime.datetime.now() + datetime.timedelta(minutes=slot_minutes)
+        if immediate_start > base_dt:
+            base_dt = immediate_start
+
+    estimated_dt = base_dt + datetime.timedelta(minutes=patients_ahead * slot_minutes)
+    return estimated_dt.time(), patients_ahead + 1
+
+
+def format_patient_service_time(patient):
+    """Show the queue-predicted consultation slot for active visits."""
+    if patient.status == 'scheduled':
+        schedule_parts = []
+        if patient.consultation_date:
+            schedule_parts.append(format_consultation_date(patient.consultation_date))
+        if patient.consultation_time:
+            schedule_parts.append(format_consultation_time(patient.consultation_time))
+        if schedule_parts:
+            return f"Scheduled: {', '.join(schedule_parts)}"
+
+    if patient.consultation_time and patient.status in ['waiting', 'emergency', 'in_progress']:
+        return f"Est. {format_consultation_time(patient.consultation_time)}"
+
+    if patient.check_in_time:
+        return patient.check_in_time.strftime('%I:%M %p')
+    schedule_parts = []
+    if patient.consultation_date:
+        schedule_parts.append(format_consultation_date(patient.consultation_date))
+    if patient.consultation_time:
+        schedule_parts.append(format_consultation_time(patient.consultation_time))
+    if schedule_parts:
+        return f"Scheduled: {', '.join(schedule_parts)}"
+    return 'Pending'
+
+
+def format_schedule_slot(patient):
+    """Return a concise date/time summary for confirmations and SMS."""
+    schedule_parts = []
+    if patient.consultation_date:
+        schedule_parts.append(format_consultation_date(patient.consultation_date))
+    if patient.consultation_time:
+        schedule_parts.append(format_consultation_time(patient.consultation_time))
+    return ', '.join(schedule_parts) if schedule_parts else 'Not scheduled'
+
+
+def ensure_patient_schema():
+    """Apply small SQLite schema upgrades without a migration framework."""
+    patient_columns = {
+        row[1] for row in db.session.execute(text("PRAGMA table_info(patient)")).fetchall()
+    }
+    if 'consultation_date' not in patient_columns:
+        db.session.execute(text("ALTER TABLE patient ADD COLUMN consultation_date DATE"))
+        db.session.commit()
+        print("[OK] Added patient.consultation_date column")
+    if 'consultation_time' not in patient_columns:
+        db.session.execute(text("ALTER TABLE patient ADD COLUMN consultation_time TIME"))
+        db.session.commit()
+        print("[OK] Added patient.consultation_time column")
+
+    db.session.execute(text("""
+        UPDATE patient
+        SET consultation_date = date(check_in_time)
+        WHERE consultation_date IS NULL
+          AND check_in_time IS NOT NULL
+    """))
+    db.session.execute(text("""
+        UPDATE patient
+        SET consultation_time = time(check_in_time)
+        WHERE consultation_time IS NULL
+          AND check_in_time IS NOT NULL
+    """))
+    db.session.commit()
+
+
+def normalize_mobile_number(phone):
+    """Convert local mobile numbers into a likely E.164 format for SMS APIs."""
+    raw = (phone or '').strip()
+    digits = ''.join(ch for ch in raw if ch.isdigit())
+    default_cc = os.environ.get('SMS_DEFAULT_COUNTRY_CODE', '+91').strip() or '+91'
+    if not default_cc.startswith('+'):
+        default_cc = f'+{default_cc}'
+
+    if raw.startswith('+') and digits:
+        return f'+{digits}'
+    if len(digits) == 10:
+        return f'{default_cc}{digits}'
+    if len(digits) > 10:
+        return f'+{digits}'
+    return raw
+
+
+def build_registration_sms(patient):
+    """Build the registration confirmation SMS body."""
+    queue_text = patient.queue_number or 'Will be assigned on arrival'
+    return (
+        "Smart Hospital registration confirmed.\n"
+        f"Patient ID: {patient.patient_id}\n"
+        f"Name: {patient.name}\n"
+        f"Department: {patient.department}\n"
+        f"Visit Type: {patient.consultation_type.replace('-', ' ').title()}\n"
+        f"Scheduled Date: {format_consultation_date(patient.consultation_date)}\n"
+        f"Estimated Consultation Time: {format_consultation_time(patient.consultation_time)}\n"
+        f"Status: {patient.status.replace('_', ' ').title()}\n"
+        f"Queue: {queue_text}"
+    )
+
+
+def sms_is_configured():
+    """Check whether the configured SMS provider has the required credentials."""
+    provider = os.environ.get('SMS_PROVIDER', 'twilio').strip().lower()
+    if provider == 'twilio':
+        required = [
+            os.environ.get('TWILIO_ACCOUNT_SID', '').strip(),
+            os.environ.get('TWILIO_AUTH_TOKEN', '').strip(),
+            os.environ.get('TWILIO_FROM_NUMBER', '').strip(),
+        ]
+        return all(required)
+
+    if provider == 'textbee':
+        required = [
+            os.environ.get('TEXTBEE_API_KEY', '').strip(),
+            os.environ.get('TEXTBEE_DEVICE_ID', '').strip(),
+        ]
+        return all(required)
+
+    return False
+
+
+def send_registration_sms(patient):
+    """Send a registration confirmation SMS when provider credentials are available."""
+    provider = os.environ.get('SMS_PROVIDER', 'twilio').strip().lower()
+    if not sms_is_configured():
+        return {'sent': False, 'reason': 'sms_not_configured'}
+
+    to_number = normalize_mobile_number(patient.phone)
+    body = build_registration_sms(patient)
+
+    if provider == 'twilio':
+        account_sid = os.environ.get('TWILIO_ACCOUNT_SID', '').strip()
+        auth_token = os.environ.get('TWILIO_AUTH_TOKEN', '').strip()
+        from_number = os.environ.get('TWILIO_FROM_NUMBER', '').strip()
+
+        post_body = urlencode({
+            'To': to_number,
+            'From': from_number,
+            'Body': body,
+        }).encode('utf-8')
+
+        auth_header = base64.b64encode(f"{account_sid}:{auth_token}".encode('utf-8')).decode('ascii')
+        req = Request(
+            url=f'https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json',
+            data=post_body,
+            headers={
+                'Authorization': f'Basic {auth_header}',
+                'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            method='POST'
+        )
+
+        with urlopen(req, timeout=15) as response:
+            payload = json.loads(response.read().decode('utf-8'))
+        return {
+            'sent': True,
+            'provider': 'twilio',
+            'sid': payload.get('sid'),
+            'to': to_number,
+        }
+
+    if provider == 'textbee':
+        api_key = os.environ.get('TEXTBEE_API_KEY', '').strip()
+        device_id = os.environ.get('TEXTBEE_DEVICE_ID', '').strip()
+        payload = {
+            'recipients': [to_number],
+            'message': body,
+        }
+        req = Request(
+            url=f'https://api.textbee.dev/api/v1/gateway/devices/{device_id}/send-sms',
+            data=json.dumps(payload).encode('utf-8'),
+            headers={
+                'x-api-key': api_key,
+                'Content-Type': 'application/json',
+            },
+            method='POST'
+        )
+
+        with urlopen(req, timeout=15) as response:
+            response_payload = json.loads(response.read().decode('utf-8'))
+        return {
+            'sent': True,
+            'provider': 'textbee',
+            'response': response_payload,
+            'to': to_number,
+        }
+
+    return {'sent': False, 'reason': f'unsupported_provider:{provider}'}
+
 @login_manager.user_loader
 def load_user(user_id):
     return User.query.get(int(user_id))
 
+# ──────────────────────────────────────────────────────────────────────────────
+# CORE HELPER: extract a FaceNet embedding from raw image bytes
+# Priority: facenet-pytorch > DeepFace/Facenet512 > OpenCV pixel fallback
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _extract_embedding_from_image_bytes(image_bytes):
+    """
+    Given raw bytes of an image, return a normalised 512-dim np.float32 list
+    embedding and the model name used.
+    Returns (embedding_list, model_name) or (None, None) if all backends fail.
+    """
+    try:
+        img_pil = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+    except Exception as e:
+        print(f"[EMBED] Failed to decode image bytes: {e}")
+        return None, None
+
+    # ── Priority 1: facenet-pytorch (MTCNN → InceptionResNetV1 VGGFace2) ──
+    if FACENET_AVAILABLE and MTCNN_DETECTOR is not None and FACENET_MODEL is not None:
+        try:
+            face_tensor = MTCNN_DETECTOR(img_pil)   # aligned, normalised tensor, or None
+            if face_tensor is not None:
+                with torch.no_grad():
+                    emb = FACENET_MODEL(face_tensor.unsqueeze(0).to(FACENET_DEVICE))
+                    emb = torch.nn.functional.normalize(emb, p=2, dim=1)
+                    return emb.squeeze().cpu().numpy().astype(np.float32).tolist(), "FaceNet-VGGFace2"
+            else:
+                print("[EMBED] MTCNN: no face detected, trying DeepFace...")
+        except Exception as e:
+            print(f"[EMBED] facenet-pytorch error: {e}")
+
+    # ── Priority 2a: DeepFace with MTCNN detector (Facenet512, 512-D) ──────
+    if DEEPFACE_AVAILABLE:
+        try:
+            img_np = np.array(img_pil)
+            results = DeepFace.represent(
+                img_path=img_np,
+                model_name='Facenet512',
+                detector_backend='mtcnn',
+                enforce_detection=True,
+                align=True,
+                normalization='Facenet2018'
+            )
+            if results:
+                return results[0]['embedding'], "DeepFace-Facenet512-mtcnn"
+        except Exception:
+            pass  # fall through to opencv
+
+        # ── Priority 2b: DeepFace with opencv detector (relaxed detection) ─
+        try:
+            img_np = np.array(img_pil)
+            results = DeepFace.represent(
+                img_path=img_np,
+                model_name='Facenet512',
+                detector_backend='opencv',
+                enforce_detection=False,
+                align=True,
+                normalization='Facenet2018'
+            )
+            if results:
+                return results[0]['embedding'], "DeepFace-Facenet512-opencv"
+        except Exception as e:
+            print(f"[EMBED] DeepFace error: {e}")
+
+    # ── Priority 3: OpenCV Haar + pixel descriptor (512-D, last resort) ─────
+    if OPENCV_AVAILABLE and FACE_CASCADE is not None:
+        try:
+            img_bgr = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+            gray   = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+            faces  = FACE_CASCADE.detectMultiScale(gray, 1.1, 4, minSize=(40, 40))
+            if len(faces) > 0:
+                x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+                roi  = cv2.resize(img_bgr[y:y+h, x:x+w], (32, 16)).flatten().astype(np.float32)
+                norm = np.linalg.norm(roi)
+                roi  = roi / (norm + 1e-8)
+                return roi.tolist(), "OpenCV-Haar-Fallback"
+        except Exception as e:
+            print(f"[EMBED] OpenCV fallback error: {e}")
+
+    return None, None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TRAIN FACE MODEL
+# Iterates all patients with stored face images, re-generates high-quality
+# FaceNet / DeepFace embeddings, saves them, and computes dataset-level
+# cosine-similarity statistics to derive recommended matching thresholds.
+# ──────────────────────────────────────────────────────────────────────────────
+
 def train_face_model():
-    """Train face recognition model with ML classifier"""
-    print("\n" + "="*60)
-    print("🧠 TRAINING FACE RECOGNITION MODEL (ML-BASED)")
-    print("="*60)
-    
+    """
+    Re-generate FaceNet/DeepFace embeddings for every patient that has a
+    stored face image, update their face_descriptor in the DB, then compute
+    cosine-similarity statistics and save recommended thresholds to
+    FaceRecognitionModel.
+    """
+    print("\n" + "="*65)
+    print(" FACE RECOGNITION – MODEL TRAINING (FaceNet + DeepFace)")
+    print("="*65)
+
     try:
         with app.app_context():
-            # Get all patients with face embeddings and images
-            patients = Patient.query.filter(Patient.face_descriptor.isnot(None)).all()
-            
-            if len(patients) < 2:
-                print("[!] Not enough patients for training (minimum 2 required)")
-                return
-            
-            print(f"[*] Loading {len(patients)} patient face data...")
-            
-            # Method 1: Use face_recognition library (best embeddings)
-            if FACE_RECOGNITION_AVAILABLE and SKLEARN_AVAILABLE:
-                print("[*] Using face_recognition library for embeddings...")
-                return train_with_face_recognition(patients)
-            
-            # Method 2: Use scikit-learn SVM on existing embeddings
-            elif SKLEARN_AVAILABLE:
-                print("[*] Using SVM classifier on existing embeddings...")
-                return train_with_svm(patients)
-            
-            # Method 3: Fallback to threshold-based approach
-            else:
-                print("[*] Using statistical threshold training...")
-                return train_with_statistical_thresholds(patients)
-    
+            patients_with_images = Patient.query.filter(
+                Patient.face_image.isnot(None)
+            ).all()
+
+            if not patients_with_images:
+                print("[!] No patients with stored face images. Register patients first.")
+                return None
+
+            print(f"[*] Found {len(patients_with_images)} patients with face images.")
+            print("[*] Re-generating embeddings\u2026\n")
+
+            success, failed = 0, 0
+            model_usage = {}
+
+            for patient in patients_with_images:
+                try:
+                    raw = patient.face_image or ''
+                    if ',' in raw:
+                        raw = raw.split(',', 1)[1]
+                    image_bytes = base64.b64decode(raw)
+
+                    embedding, model_name = _extract_embedding_from_image_bytes(image_bytes)
+
+                    if embedding is None:
+                        raise ValueError("No face detected in stored image")
+
+                    patient.face_descriptor = json.dumps(embedding)
+                    model_usage[model_name] = model_usage.get(model_name, 0) + 1
+                    success += 1
+                    print(f"  [OK]   {patient.name:30s} ({patient.patient_id})  "
+                          f"dim={len(embedding)}  model={model_name}")
+
+                except Exception as e:
+                    failed += 1
+                    print(f"  [FAIL] {patient.name} ({patient.patient_id}): {e}")
+
+            db.session.commit()
+            print(f"\n[*] Done: {success} OK, {failed} failed  |  backends used: {model_usage}")
+
+            # ── Compute pairwise cosine statistics on newly stored embeddings ──
+            valid_embs = []
+            for p in Patient.query.filter(Patient.face_descriptor.isnot(None)).all():
+                try:
+                    e = np.array(json.loads(p.face_descriptor), dtype=np.float32)
+                    n = np.linalg.norm(e)
+                    if n > 0:
+                        valid_embs.append(e / n)
+                except Exception:
+                    continue
+
+            if len(valid_embs) < 2:
+                print("[!] <2 valid embeddings; cannot compute thresholds.")
+                return None
+
+            sims, dists = [], []
+            for i in range(len(valid_embs)):
+                for j in range(i + 1, len(valid_embs)):
+                    sims.append(float(np.dot(valid_embs[i], valid_embs[j])))
+                    dists.append(float(np.linalg.norm(valid_embs[i] - valid_embs[j])))
+
+            sim_arr  = np.array(sims,  dtype=np.float32)
+            dist_arr = np.array(dists, dtype=np.float32)
+
+            print(f"\n[STATISTICS ({len(valid_embs)} patients, {len(sims)} pairs)]")
+            print(f"  Cosine sim   | mean={sim_arr.mean():.4f}  std={sim_arr.std():.4f}  "
+                  f"range=[{sim_arr.min():.4f}, {sim_arr.max():.4f}]")
+            print(f"  Euclidean    | mean={dist_arr.mean():.4f}  std={dist_arr.std():.4f}  "
+                  f"range=[{dist_arr.min():.4f}, {dist_arr.max():.4f}]")
+
+            # Gate at the 70th percentile of inter-person similarities
+            # (same-identity pairs will score well above this)
+            opt_cos  = float(np.clip(np.percentile(sim_arr,  70), 0.45, 0.90))
+            opt_euc  = float(np.clip(np.percentile(dist_arr, 70), 0.15, 1.20))
+
+            print(f"\n[THRESHOLDS]  cosine>={opt_cos:.4f}  euclidean<={opt_euc:.4f}")
+
+            # ── Persist ──
+            model_row = _get_active_face_model_row()
+            if not model_row:
+                model_row = FaceRecognitionModel()
+
+            model_row.model_name          = 'FaceNet-VGGFace2+DeepFace'
+            model_row.cosine_threshold    = opt_cos
+            model_row.euclidean_threshold = opt_euc
+            model_row.similarity_gap      = DEFAULT_SIMILARITY_GAP
+            model_row.last_trained        = datetime.datetime.utcnow()
+            model_row.total_patients      = len(valid_embs)
+            model_row.accuracy            = float(success) / max(len(patients_with_images), 1)
+            model_row.training_data       = json.dumps({
+                'method':              'FaceNet-VGGFace2+DeepFace',
+                'total_patients':      len(valid_embs),
+                'images_processed':    success,
+                'images_failed':       failed,
+                'models_used':         model_usage,
+                'cosine_mean':         float(sim_arr.mean()),
+                'cosine_std':          float(sim_arr.std()),
+                'euclidean_mean':      float(dist_arr.mean()),
+                'euclidean_std':       float(dist_arr.std()),
+                'cosine_threshold':    opt_cos,
+                'euclidean_threshold': opt_euc,
+            })
+
+            db.session.add(model_row)
+            db.session.commit()
+
+            result_dict = {
+                'cosine_threshold': model_row.cosine_threshold,
+                'euclidean_threshold': model_row.euclidean_threshold,
+                'total_patients': model_row.total_patients
+            }
+
+            print("\n[OK] Face model trained and thresholds saved.")
+            print("="*65 + "\n")
+            return result_dict
+
     except Exception as e:
         print(f"[ERROR] Training failed: {e}")
         import traceback
         traceback.print_exc()
         return None
 
-def train_with_svm(patients):
-    """Train SVM classifier on face embeddings"""
-    from sklearn.svm import SVC
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.model_selection import train_test_split
-    
-    try:
-        embeddings = []
-        labels = []
-        valid_patients = []
-        
-        # Extract embeddings and labels
-        for idx, patient in enumerate(patients):
-            try:
-                embedding = np.array(json.loads(patient.face_descriptor), dtype=np.float32)
-                if len(embedding) == 2048:
-                    embedding = embedding / (np.linalg.norm(embedding) + 1e-8)
-                    embeddings.append(embedding)
-                    labels.append(idx)
-                    valid_patients.append(patient)
-            except Exception as e:
-                print(f"[!] Error loading embedding for {patient.name}: {e}")
-                continue
-        
-        if len(embeddings) < 2:
-            print("[!] Not enough valid embeddings for training")
-            return None
-        
-        embeddings = np.array(embeddings)
-        labels = np.array(labels)
-        
-        print(f"[OK] Loaded {len(embeddings)} valid embeddings from {len(valid_patients)} patients")
-        
-        # Split data for training and testing
-        X_train, X_test, y_train, y_test = train_test_split(
-            embeddings, labels, test_size=0.2, random_state=42, stratify=labels if len(np.unique(labels)) > 1 else None
-        )
-        
-        # Scale features
-        scaler = StandardScaler()
-        X_train_scaled = scaler.fit_transform(X_train)
-        X_test_scaled = scaler.transform(X_test)
-        
-        # Train SVM with RBF kernel
-        print("[*] Training SVM classifier...")
-        svm = SVC(kernel='rbf', C=1.0, gamma='scale', probability=True)
-        svm.fit(X_train_scaled, y_train)
-        
-        # Evaluate
-        train_accuracy = svm.score(X_train_scaled, y_train)
-        test_accuracy = svm.score(X_test_scaled, y_test)
-        
-        print(f"[TRAINING RESULTS]")
-        print(f"  Training Accuracy: {train_accuracy*100:.2f}%")
-        print(f"  Testing Accuracy:  {test_accuracy*100:.2f}%")
-        print(f"  Total Samples:     {len(embeddings)}")
-        print(f"  Training Samples:  {len(X_train)}")
-        print(f"  Testing Samples:   {len(X_test)}")
-        print(f"  Number of Classes: {len(np.unique(labels))}")
-        
-        # Calculate pairwise statistics
-        similarities = []
-        distances = []
-        for i in range(len(embeddings)):
-            for j in range(i+1, len(embeddings)):
-                sim = float(np.dot(embeddings[i], embeddings[j]))
-                dist = float(np.linalg.norm(embeddings[i] - embeddings[j]))
-                similarities.append(sim)
-                distances.append(dist)
-        
-        print(f"\n[EMBEDDING STATISTICS]")
-        print(f"  Similarity (Mean): {np.mean(similarities):.4f} ± {np.std(similarities):.4f}")
-        print(f"  Distance (Mean):   {np.mean(distances):.2f} ± {np.std(distances):.2f}")
-        print(f"  Similarity Range:  [{np.min(similarities):.4f}, {np.max(similarities):.4f}]")
-        print(f"  Distance Range:    [{np.min(distances):.2f}, {np.max(distances):.2f}]")
-        
-        # Calculate optimal thresholds
-        optimal_cosine = np.percentile(similarities, 85)
-        optimal_euclidean = np.percentile(distances, 85)
-        
-        print(f"\n[RECOMMENDED THRESHOLDS]")
-        print(f"  Cosine Similarity:  {optimal_cosine:.4f}")
-        print(f"  Euclidean Distance: {optimal_euclidean:.2f}")
-        
-        # Store trained model
-        model = FaceRecognitionModel.query.first()
-        if not model:
-            model = FaceRecognitionModel()
-        
-        model.cosine_threshold = float(optimal_cosine)
-        model.euclidean_threshold = float(optimal_euclidean)
-        model.similarity_gap = 0.20
-        model.last_trained = datetime.datetime.utcnow()
-        model.total_patients = len(embeddings)
-        model.training_data = json.dumps({
-            'method': 'SVM-Classifier',
-            'train_accuracy': float(train_accuracy),
-            'test_accuracy': float(test_accuracy),
-            'total_patients': len(embeddings),
-            'similarity_mean': float(np.mean(similarities)),
-            'similarity_std': float(np.std(similarities)),
-            'distance_mean': float(np.mean(distances)),
-            'distance_std': float(np.std(distances))
-        })
-        
-        db.session.add(model)
-        db.session.commit()
-        
-        print(f"\n[OK] SVM Model trained and saved successfully!")
-        print("="*60 + "\n")
-        return model
-        
-    except Exception as e:
-        print(f"[ERROR] SVM training failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
 
-def train_with_face_recognition(patients):
-    """Train model using face_recognition library embeddings"""
-    try:
-        import face_recognition as fr
-        import tempfile
-        import base64
-        from PIL import Image
-        import io
-        
-        print("[*] Extracting face encoding using face_recognition...")
-        
-        embeddings = []
-        labels = []
-        valid_patients = []
-        
-        # Extract face encodings from stored face images
-        for idx, patient in enumerate(patients):
-            try:
-                if patient.face_image:
-                    # Decode face image from base64
-                    image_data = patient.face_image.split(',')[1] if ',' in patient.face_image else patient.face_image
-                    image_bytes = base64.b64decode(image_data)
-                    image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-                    image_np = np.array(image)
-                    
-                    # Get face encoding from face_recognition library
-                    encodings = fr.face_encodings(image_np)
-                    if encodings:
-                        # Use the first (and usually only) face detected
-                        embedding = np.array(encodings[0], dtype=np.float32)
-                        embeddings.append(embedding)
-                        labels.append(idx)
-                        valid_patients.append(patient)
-                        print(f"  [OK] {patient.name}: encoding extracted")
-            except Exception as e:
-                print(f"  [X] {patient.name}: {e}")
-                continue
-        
-        if len(embeddings) < 2:
-            print("[!] Could not extract encodings for enough patients")
-            return None
-        
-        embeddings = np.array(embeddings)
-        labels = np.array(labels)
-        
-        print(f"[OK] Extracted {len(embeddings)} face encodings")
-        
-        # Train SVM on face_recognition embeddings
-        if SKLEARN_AVAILABLE:
-            from sklearn.svm import SVC
-            from sklearn.preprocessing import StandardScaler
-            from sklearn.model_selection import train_test_split
-            
-            # Split and scale
-            split_result = train_test_split(
-                embeddings, labels, test_size=0.2, random_state=42, 
-                stratify=labels if len(np.unique(labels)) > 1 else None
-            )
-            X_train, X_test, y_train, y_test = split_result
-            
-            scaler = StandardScaler()
-            X_train_scaled = scaler.fit_transform(X_train)
-            X_test_scaled = scaler.transform(X_test)
-            
-            # Train SVM
-            print("[*] Training SVM on face_recognition embeddings...")
-            svm = SVC(kernel='rbf', C=1.0, gamma='scale', probability=True)
-            svm.fit(X_train_scaled, y_train)
-            
-            train_acc = svm.score(X_train_scaled, y_train)
-            test_acc = svm.score(X_test_scaled, y_test)
-            
-            print(f"[TRAINING RESULTS]")
-            print(f"  Train Accuracy: {train_acc*100:.2f}%")
-            print(f"  Test Accuracy:  {test_acc*100:.2f}%")
-        
-        # Calculate thresholds
-        distances = []
-        for i in range(len(embeddings)):
-            for j in range(i+1, len(embeddings)):
-                dist = float(np.linalg.norm(embeddings[i] - embeddings[j]))
-                distances.append(dist)
-        
-        threshold = np.percentile(distances, 85) if distances else 0.6
-        
-        print(f"\n[FACE ENCODING STATISTICS]")
-        print(f"  Encoding dimension: {len(embeddings[0])}")
-        print(f"  Distance threshold: {threshold:.4f}")
-        print(f"  Distance range: [{np.min(distances):.4f}, {np.max(distances):.4f}]")
-        
-        # Store model
-        model = FaceRecognitionModel.query.first()
-        if not model:
-            model = FaceRecognitionModel()
-        
-        model.cosine_threshold = 0.85
-        model.euclidean_threshold = threshold
-        model.similarity_gap = 0.20
-        model.last_trained = datetime.datetime.utcnow()
-        model.total_patients = len(embeddings)
-        model.training_data = json.dumps({
-            'method': 'face_recognition-library',
-            'encoding_dim': 128,
-            'distance_threshold': float(threshold),
-            'total_samples': len(embeddings)
-        })
-        
-        db.session.add(model)
-        db.session.commit()
-        
-        print(f"\n[OK] face_recognition model trained successfully!")
-        print("="*60 + "\n")
-        return model
-        
-    except Exception as e:
-        print(f"[ERROR] face_recognition training failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+# Legacy training functions removed.
 
-def train_with_statistical_thresholds(patients):
-    """Fallback: Train using statistical thresholds"""
-    print("[*] Using statistical approach...")
-    
-    try:
-        embeddings = []
-        for patient in patients:
-            try:
-                embedding = np.array(json.loads(patient.face_descriptor), dtype=np.float32)
-                if len(embedding) == 2048:
-                    embedding = embedding / (np.linalg.norm(embedding) + 1e-8)
-                    embeddings.append(embedding)
-            except:
-                continue
-        
-        if len(embeddings) < 2:
-            print("[!] Not enough valid embeddings")
-            return None
-        
-        embeddings = np.array(embeddings)
-        
-        # Calculate statistics
-        similarities = []
-        distances = []
-        for i in range(len(embeddings)):
-            for j in range(i+1, len(embeddings)):
-                sim = float(np.dot(embeddings[i], embeddings[j]))
-                dist = float(np.linalg.norm(embeddings[i] - embeddings[j]))
-                similarities.append(sim)
-                distances.append(dist)
-        
-        print(f"\n[STATISTICS]")
-        print(f"  Samples: {len(embeddings)}")
-        print(f"  Similarity: {np.mean(similarities):.4f} ± {np.std(similarities):.4f}")
-        print(f"  Distance: {np.mean(distances):.2f} ± {np.std(distances):.2f}")
-        
-        optimal_cosine = np.percentile(similarities, 90)
-        optimal_euclidean = np.percentile(distances, 90)
-        
-        print(f"\n[THRESHOLDS]")
-        print(f"  Cosine: {optimal_cosine:.4f}")
-        print(f"  Euclidean: {optimal_euclidean:.2f}")
-        
-        model = FaceRecognitionModel.query.first()
-        if not model:
-            model = FaceRecognitionModel()
-        
-        model.cosine_threshold = float(optimal_cosine)
-        model.euclidean_threshold = float(optimal_euclidean)
-        model.similarity_gap = 0.20
-        model.last_trained = datetime.datetime.utcnow()
-        model.total_patients = len(embeddings)
-        model.training_data = json.dumps({
-            'method': 'statistical',
-            'total_samples': len(embeddings)
-        })
-        
-        db.session.add(model)
-        db.session.commit()
-        
-        print(f"\n[OK] Model trained successfully!")
-        print("="*60 + "\n")
-        
-        return model
-    
-    except Exception as e:
-        print(f"[ERROR] Training failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+def _get_active_face_model_row():
+    """Prefer a trained model row; otherwise fall back to the oldest default row."""
+    trained = FaceRecognitionModel.query.filter(
+        FaceRecognitionModel.total_patients > 0
+    ).order_by(
+        FaceRecognitionModel.last_trained.desc(),
+        FaceRecognitionModel.id.desc()
+    ).first()
+    if trained:
+        return trained
+
+    return FaceRecognitionModel.query.order_by(FaceRecognitionModel.id.asc()).first()
 
 
 def get_face_model_config():
     """Get current face recognition model configuration"""
     with app.app_context():
-        model = FaceRecognitionModel.query.first()
+        model = _get_active_face_model_row()
         if model:
             return {
                 'cosine_threshold': model.cosine_threshold,
@@ -568,6 +781,177 @@ def get_face_model_config():
         'similarity_gap': 0.05
     }
 
+
+def _normalize_face_embedding(raw_embedding):
+    """Return a unit-length numpy embedding, or None when the input is invalid."""
+    try:
+        if raw_embedding is None:
+            return None
+        if isinstance(raw_embedding, str):
+            raw_embedding = json.loads(raw_embedding)
+
+        embedding = np.array(raw_embedding, dtype=np.float32)
+        if embedding.ndim != 1 or embedding.size == 0:
+            return None
+
+        norm = np.linalg.norm(embedding)
+        if norm < 1e-6:
+            return None
+
+        return embedding / norm
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def _match_patient_by_embedding(probe_embedding):
+    """Find the best confirmed patient match for a captured face embedding."""
+    probe_unit = _normalize_face_embedding(probe_embedding)
+    if probe_unit is None:
+        return {
+            'found': False,
+            'error': 'Invalid (zero-norm) embedding received'
+        }
+
+    probe_dim = len(probe_unit)
+
+    cfg = get_face_model_config()
+    cosine_th = cfg['cosine_threshold']
+    euclidean_th = cfg['euclidean_threshold']
+    gap_th = cfg['similarity_gap']
+
+    patients = Patient.query.filter(Patient.face_descriptor.isnot(None)).all()
+    all_scores = []
+
+    for patient in patients:
+        stored_unit = _normalize_face_embedding(patient.face_descriptor)
+        if stored_unit is None or len(stored_unit) != probe_dim:
+            continue
+
+        cos = float(np.dot(probe_unit, stored_unit))
+        dist = float(np.linalg.norm(probe_unit - stored_unit))
+        all_scores.append((cos, dist, patient))
+
+    all_scores.sort(key=lambda item: item[0], reverse=True)
+
+    print(f"\n[FACE MATCH] probe_dim={probe_dim}  candidates={len(all_scores)}")
+    for cos, dist, patient in all_scores[:5]:
+        print(f"  {patient.name:30s}  cosine={cos:.4f}  euclidean={dist:.4f}")
+
+    if not all_scores:
+        return {
+            'found': False,
+            'message': 'No registered patients found in database.',
+            'matching_thresholds': {
+                'cosine': cosine_th,
+                'euclidean': euclidean_th,
+                'gap': gap_th,
+            },
+        }
+
+    best_cos, best_dist, best_patient = all_scores[0]
+    second_cos = all_scores[1][0] if len(all_scores) > 1 else -1.0
+    gap = best_cos - second_cos
+
+    excellent = best_cos >= FACE_MATCH_EXCELLENT_THRESHOLD
+    std_cosine = best_cos >= cosine_th
+    std_dist = best_dist <= euclidean_th
+    confirmed = excellent or (std_cosine and std_dist)
+
+    print(f"  Thresholds  cosine>={cosine_th}  euclidean<={euclidean_th}  gap>={gap_th}")
+    print(f"  excellent={excellent}  cosine={std_cosine}  dist={std_dist}")
+    print(f"  RESULT: {'MATCH [OK]' if confirmed else 'NO MATCH [X]'}  ({best_patient.name})")
+
+    return {
+        'found': confirmed,
+        'best_patient': best_patient,
+        'best_similarity': round(best_cos, 4),
+        'best_distance': round(best_dist, 4),
+        'similarity_gap': round(gap, 4),
+        'confidence': {
+            'cosine_similarity': round(best_cos, 4),
+            'euclidean_distance': round(best_dist, 4),
+            'similarity_gap': round(gap, 4),
+            'is_excellent_match': excellent,
+        },
+        'matching_thresholds': {
+            'cosine': cosine_th,
+            'euclidean': euclidean_th,
+            'gap': gap_th,
+        }
+    }
+
+
+def _normalize_digit_string(value):
+    """Keep only digits so phone/Aadhaar comparisons survive formatting changes."""
+    return ''.join(ch for ch in (value or '') if ch.isdigit())
+
+
+def _normalize_phone_lookup(phone):
+    """Return a comparison-friendly phone key, typically the last 10 digits."""
+    digits = _normalize_digit_string(phone)
+    if len(digits) >= 10:
+        return digits[-10:]
+    return digits
+
+
+def _normalize_aadhaar_lookup(aadhaar_number):
+    """Return a comparison-friendly Aadhaar key."""
+    digits = _normalize_digit_string(aadhaar_number)
+    if len(digits) >= 12:
+        return digits[-12:]
+    return digits
+
+
+def _find_existing_patient_for_registration(existing_patient_id=None, aadhaar_number=None,
+                                            phone=None, face_descriptor=None, name=None):
+    """
+    Resolve an existing patient record using stable identifiers first.
+
+    Priority:
+      1. explicit existing_patient_id from the frontend
+      2. Aadhaar number
+      3. normalized phone number
+      4. face embedding match
+    """
+    if existing_patient_id:
+        patient = Patient.query.filter_by(patient_id=existing_patient_id).first()
+        if patient:
+            return patient, 'existing_patient_id'
+
+    aadhaar_key = _normalize_aadhaar_lookup(aadhaar_number)
+    if aadhaar_key:
+        aadhaar_matches = Patient.query.filter(Patient.aadhaar_number.isnot(None)).all()
+        for patient in sorted(aadhaar_matches, key=lambda p: p.id, reverse=True):
+            if _normalize_aadhaar_lookup(patient.aadhaar_number) == aadhaar_key:
+                return patient, 'aadhaar_number'
+
+    phone_key = _normalize_phone_lookup(phone)
+    if phone_key:
+        phone_matches = Patient.query.filter(Patient.phone.isnot(None)).all()
+        same_phone = []
+        for patient in phone_matches:
+            if _normalize_phone_lookup(patient.phone) == phone_key:
+                same_phone.append(patient)
+
+        if same_phone:
+            if name:
+                name_key = name.strip().lower()
+                same_name = [
+                    patient for patient in same_phone
+                    if (patient.name or '').strip().lower() == name_key
+                ]
+                if same_name:
+                    return sorted(same_name, key=lambda p: p.id, reverse=True)[0], 'phone+name'
+
+            return sorted(same_phone, key=lambda p: p.id, reverse=True)[0], 'phone'
+
+    if face_descriptor:
+        match_result = _match_patient_by_embedding(face_descriptor)
+        if match_result.get('found') and match_result.get('best_patient') is not None:
+            return match_result['best_patient'], 'face'
+
+    return None, None
+
 def init_db():
     """Initialize database with sample data"""
     with app.app_context():
@@ -581,6 +965,7 @@ def init_db():
         # Create all tables
         db.create_all()
         print("[OK] Database tables created")
+        ensure_patient_schema()
         
         # Add sample departments (only if none exist)
         if Department.query.count() == 0:
@@ -638,45 +1023,47 @@ def init_db():
             for dept in departments:
                 db.session.add(dept)
             
-            # Create admin user
+            user_count_before = User.query.count()
+
+            # Create admin user on a fresh database.
             admin = User.query.filter_by(username='admin').first()
             if not admin:
                 admin = User(username='admin', full_name='Administrator', role='admin')
                 admin.set_password('admin123')
                 db.session.add(admin)
-            
-            # Create sample doctor users for each department
-            doctors = [
-                # Cardiology Doctors
-                {'username': 'dr_smith', 'full_name': 'Dr. John Smith', 'department': 'Cardiology'},
-                {'username': 'dr_miller', 'full_name': 'Dr. Robert Miller', 'department': 'Cardiology'},
-                {'username': 'dr_chen', 'full_name': 'Dr. Lisa Chen', 'department': 'Cardiology'},
+
+            # Seed sample doctors only when the user table is empty.
+            # This keeps admin deletions persistent across restarts.
+            if user_count_before == 0:
+                doctors = [
+                    # Cardiology Doctors
+                    {'username': 'dr_smith', 'full_name': 'Dr. John Smith', 'department': 'Cardiology'},
+                    {'username': 'dr_miller', 'full_name': 'Dr. Robert Miller', 'department': 'Cardiology'},
+                    {'username': 'dr_chen', 'full_name': 'Dr. Lisa Chen', 'department': 'Cardiology'},
+
+                    # Emergency Doctors
+                    {'username': 'dr_jones', 'full_name': 'Dr. Sarah Jones', 'department': 'Emergency'},
+                    {'username': 'dr_kumar', 'full_name': 'Dr. Rajesh Kumar', 'department': 'Emergency'},
+
+                    # Gynaecology Doctors
+                    {'username': 'dr_wang', 'full_name': 'Dr. Emily Wang', 'department': 'Gynaecology'},
+                    {'username': 'dr_sharma', 'full_name': 'Dr. Priya Sharma', 'department': 'Gynaecology'},
+                    {'username': 'dr_jackson', 'full_name': 'Dr. Maria Jackson', 'department': 'Gynaecology'},
+
+                    # Orthopedics Doctors
+                    {'username': 'dr_patel', 'full_name': 'Dr. Raj Patel', 'department': 'Orthopedics'},
+                    {'username': 'dr_rodriguez', 'full_name': 'Dr. Carlos Rodriguez', 'department': 'Orthopedics'},
+
+                    # Pediatrics Doctors
+                    {'username': 'dr_anderson', 'full_name': 'Dr. David Anderson', 'department': 'Pediatrics'},
+                    {'username': 'dr_gupta', 'full_name': 'Dr. Anjali Gupta', 'department': 'Pediatrics'},
+
+                    # Pharmacy Staff
+                    {'username': 'pharm_lee', 'full_name': 'Ms. Jennifer Lee', 'department': 'Pharmacy'},
+                    {'username': 'pharm_wilson', 'full_name': 'Mr. James Wilson', 'department': 'Pharmacy'},
+                ]
                 
-                # Emergency Doctors
-                {'username': 'dr_jones', 'full_name': 'Dr. Sarah Jones', 'department': 'Emergency'},
-                {'username': 'dr_kumar', 'full_name': 'Dr. Rajesh Kumar', 'department': 'Emergency'},
-                
-                # Gynaecology Doctors
-                {'username': 'dr_wang', 'full_name': 'Dr. Emily Wang', 'department': 'Gynaecology'},
-                {'username': 'dr_sharma', 'full_name': 'Dr. Priya Sharma', 'department': 'Gynaecology'},
-                {'username': 'dr_jackson', 'full_name': 'Dr. Maria Jackson', 'department': 'Gynaecology'},
-                
-                # Orthopedics Doctors
-                {'username': 'dr_patel', 'full_name': 'Dr. Raj Patel', 'department': 'Orthopedics'},
-                {'username': 'dr_rodriguez', 'full_name': 'Dr. Carlos Rodriguez', 'department': 'Orthopedics'},
-                
-                # Pediatrics Doctors
-                {'username': 'dr_anderson', 'full_name': 'Dr. David Anderson', 'department': 'Pediatrics'},
-                {'username': 'dr_gupta', 'full_name': 'Dr. Anjali Gupta', 'department': 'Pediatrics'},
-                
-                # Pharmacy Staff
-                {'username': 'pharm_lee', 'full_name': 'Ms. Jennifer Lee', 'department': 'Pharmacy'},
-                {'username': 'pharm_wilson', 'full_name': 'Mr. James Wilson', 'department': 'Pharmacy'},
-            ]
-            
-            for doctor_data in doctors:
-                doctor = User.query.filter_by(username=doctor_data['username']).first()
-                if not doctor:
+                for doctor_data in doctors:
                     doctor = User(
                         username=doctor_data['username'],
                         full_name=doctor_data['full_name'],
@@ -685,20 +1072,21 @@ def init_db():
                     )
                     doctor.set_password('doctor123')
                     db.session.add(doctor)
-            
+                print("[OK] Sample data added with multiple doctors per department")
+                db.session.commit()
+        # Initialize the default face recognition model only once.
+        if FaceRecognitionModel.query.count() == 0:
+            model = FaceRecognitionModel(
+                model_name='RobustMultiScale',
+                cosine_threshold=0.65,
+                euclidean_threshold=10.0,
+                similarity_gap=0.05
+            )
+            db.session.add(model)
             db.session.commit()
-            print("[OK] Sample data added with multiple doctors per department")
-        
-        # Initialize face recognition model
-        model = FaceRecognitionModel(
-            model_name='RobustMultiScale',
-            cosine_threshold=0.65,
-            euclidean_threshold=10.0,
-            similarity_gap=0.05
-        )
-        db.session.add(model)
-        db.session.commit()
-        print("[OK] Face recognition model initialized")
+            print("[OK] Face recognition model initialized")
+        else:
+            print("[OK] Face recognition model already initialized")
 
 
 
@@ -714,19 +1102,45 @@ def get_base_html(title="Hospital Kiosk", content="", show_nav=True, show_chat=T
     else:
         login_link = '<li class="nav-item"><a class="nav-link px-3" href="/doctor/login"><i class="fas fa-sign-in-alt me-1"></i>Staff Login</a></li>'
 
+    language_selector = '''
+                    <li class="nav-item ms-lg-3 notranslate">
+                        <div class="language-selector d-flex align-items-center px-2 py-1">
+                            <i class="fas fa-language text-primary me-2"></i>
+                            <select class="form-select form-select-sm language-select" id="languageSwitcher" aria-label="Select language">
+                                <option value="en">English</option>
+                                <option value="kn">&#x0C95;&#x0CA8;&#xCCD;&#x0CA8;&#x0CA1;</option>
+                                <option value="ml">&#x0D2E;&#x0D32;&#x0D2F;&#x0D3E;&#x0D33;&#x0D02;</option>
+                                <option value="hi">&#x0939;&#x093F;&#x0902;&#x0926;&#x0940;</option>
+                            </select>
+                        </div>
+                    </li>
+    '''
+
+    theme_selector = '''
+                    <li class="nav-item ms-lg-2 notranslate">
+                        <div class="theme-selector d-flex align-items-center px-2 py-1">
+                            <i class="fas fa-circle-half-stroke text-primary me-2"></i>
+                            <select class="form-select form-select-sm theme-select" id="themeSwitcher" aria-label="Select theme">
+                                <option value="light">Light mode</option>
+                                <option value="dark">Dark mode</option>
+                            </select>
+                        </div>
+                    </li>
+    '''
+
     nav = ''
     if show_nav:
         nav = f'''
     <!-- Professional Sticky Navigation Bar -->
-    <nav class="navbar navbar-expand-lg navbar-light bg-white shadow-sm sticky-top">
+    <nav id="mainNavbar" class="navbar navbar-expand-lg navbar-light bg-white shadow-sm sticky-top medflow-navbar">
         <div class="container">
-            <a class="navbar-brand d-flex align-items-center" href="/">
+            <a class="navbar-brand d-flex align-items-center notranslate" href="/">
                 <div class="bg-primary text-white rounded p-1 me-2" style="width: 32px; height: 32px; display: flex; align-items: center; justify-content: center;">
                     <i class="fas fa-hospital-alt"></i>
                 </div>
                 <div class="lh-1">
-                    <div class="fw-bold text-primary" style="letter-spacing: 0.5px;">ＭＥＤＦＬＯＷ</div>
-                    <small class="text-muted" style="font-size: 0.6rem;">SMART KIOSK FOR DIGITAL HEALTHCARE</small>
+                    <div class="fw-bold brand-title" style="letter-spacing: 0.5px;">MEDFLOW</div>
+                    <small class="brand-subtitle" style="font-size: 0.6rem;">SMART KIOSK FOR DIGITAL HEALTHCARE</small>
                 </div>
             </a>
             <button class="navbar-toggler border-0 shadow-none" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
@@ -740,6 +1154,8 @@ def get_base_html(title="Hospital Kiosk", content="", show_nav=True, show_chat=T
                     <li class="nav-item"><a class="nav-link px-3" href="/navigation"><i class="fas fa-map-marked-alt me-1"></i>Map</a></li>
                     <li class="nav-item ms-lg-2"><a class="nav-link btn btn-danger btn-sm px-3 shadow-sm" href="/emergency"><i class="fas fa-ambulance me-1"></i>EMERGENCY</a></li>
                     <span class="mx-2 d-none d-lg-inline text-muted opacity-25">|</span>
+                    {language_selector}
+                    {theme_selector}
                     {login_link}
                 </ul>
             </div>
@@ -769,7 +1185,7 @@ def get_base_html(title="Hospital Kiosk", content="", show_nav=True, show_chat=T
             }.get(category, 'alert-info')
             
             flash_messages += f'''
-                <div class="alert {alert_class} alert-dismissible fade show" role="alert">
+                <div class="alert {alert_class} alert-dismissible fade show flash-message" role="alert">
                     {message}
                     <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
                 </div>
@@ -900,17 +1316,25 @@ def get_base_html(title="Hospital Kiosk", content="", show_nav=True, show_chat=T
             }
         }
         
-        function addMessage(message, sender) {
+        async function addMessage(message, sender) {
             const messagesDiv = document.getElementById('chatMessages');
             if (!messagesDiv) return;
             
             const messageDiv = document.createElement('div');
-            messageDiv.className = `message ${sender}-message`;
+            messageDiv.className = `message ${sender}-message notranslate`;
+            messageDiv.setAttribute('translate', 'no');
+            messageDiv.dataset.originalMessage = message;
+            messageDiv.dataset.messageSender = sender;
+            const targetLanguage = window.getHospitalLanguage ? window.getHospitalLanguage() : 'en';
             
             const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
             
+            const translatedMessage = sender === 'bot' && window.translateHospitalTextAsync
+                ? await window.translateHospitalTextAsync(message, targetLanguage)
+                : message;
+
             // Basic Markdown-style formatting (**bold**)
-            let formattedMessage = message.replace(/\\*\\*(.*?)\\*\\*/g, '<strong>$1</strong>');
+            let formattedMessage = translatedMessage.replace(/\\*\\*(.*?)\\*\\*/g, '<strong>$1</strong>');
             // Handle bullet points
             formattedMessage = formattedMessage.replace(/\\u2022\\s*(.*?)(?=\\n|$)/g, '<li>$1</li>');
             if (formattedMessage.includes('<li>')) {
@@ -921,7 +1345,7 @@ def get_base_html(title="Hospital Kiosk", content="", show_nav=True, show_chat=T
                 <div class="message-content">
                     <div class="d-flex align-items-start">
                         ${sender === 'bot' ? '<div class="bot-icon me-2"><i class="fas fa-robot"></i></div>' : ''}
-                        <div>${formattedMessage}</div>
+                        <div class="message-body">${formattedMessage}</div>
                     </div>
                 </div>
                 <div class="message-time">${time}</div>
@@ -929,6 +1353,9 @@ def get_base_html(title="Hospital Kiosk", content="", show_nav=True, show_chat=T
             
             messagesDiv.appendChild(messageDiv);
             messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                if (window.refreshPageTranslation) {
+                    window.refreshPageTranslation();
+                }
         }
         
         function showTypingIndicator() {
@@ -1064,6 +1491,29 @@ def get_base_html(title="Hospital Kiosk", content="", show_nav=True, show_chat=T
         });
     </script>
     '''
+
+    translation_js = '''
+    <script src="/static/local_translate.js"></script>
+    '''
+
+    theme_init_script = '''
+    <script>
+        (function() {
+            try {
+                const storedTheme = window.localStorage.getItem('hospital_theme');
+                const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+                const theme = storedTheme === 'dark' || storedTheme === 'light'
+                    ? storedTheme
+                    : (prefersDark ? 'dark' : 'light');
+                document.documentElement.setAttribute('data-theme', theme);
+                document.documentElement.style.colorScheme = theme;
+            } catch (error) {
+                document.documentElement.setAttribute('data-theme', 'light');
+                document.documentElement.style.colorScheme = 'light';
+            }
+        })();
+    </script>
+    '''
     
     # Responsive CSS - UPDATED with chatbot styles
     responsive_css = '''
@@ -1075,16 +1525,52 @@ def get_base_html(title="Hospital Kiosk", content="", show_nav=True, show_chat=T
             --success-color: #2ecc71;
             --warning-color: #f39c12;
             --dark-color: #2c3e50;
+            --page-bg: #f8f9fa;
+            --page-text: #1f2937;
+            --surface-bg: #ffffff;
+            --surface-alt: #f8fafc;
+            --border-color: rgba(15, 23, 42, 0.08);
+            --muted-text: #6b7280;
+            --navbar-bg: rgba(255, 255, 255, 0.96);
+            --navbar-text: #1f2937;
+            --navbar-muted: #6b7280;
+            --accent-color: #0d6efd;
+            --footer-bg: #111827;
+            --footer-text: #f8fafc;
+            --footer-link: rgba(255, 255, 255, 0.78);
+        }
+
+        html[data-theme='dark'] {
+            --page-bg: #0b1220;
+            --page-text: #e5e7eb;
+            --surface-bg: #111827;
+            --surface-alt: #1f2937;
+            --border-color: rgba(148, 163, 184, 0.18);
+            --muted-text: #9ca3af;
+            --navbar-bg: rgba(15, 23, 42, 0.96);
+            --navbar-text: #e5e7eb;
+            --navbar-muted: #94a3b8;
+            --accent-color: #60a5fa;
+            --footer-bg: #020617;
+            --footer-text: #e5e7eb;
+            --footer-link: rgba(226, 232, 240, 0.78);
+            color-scheme: dark;
+        }
+
+        html[data-theme='light'] {
+            color-scheme: light;
         }
         
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background-color: #f8f9fa;
-            color: var(--dark-color);
+            background-color: var(--page-bg);
+            color: var(--page-text);
             overflow-x: hidden;
             min-height: 100vh;
             position: relative;
+            top: 0 !important;
             padding-bottom: 60px; /* Space for footer */
+            transition: background-color 0.25s ease, color 0.25s ease;
         }
         
         /* Responsive Typography */
@@ -1103,17 +1589,111 @@ def get_base_html(title="Hospital Kiosk", content="", show_nav=True, show_chat=T
             transition: transform 0.3s ease;
             margin-bottom: 20px;
             height: 100%;
+            background-color: var(--surface-bg);
+            color: var(--page-text);
+            border: 1px solid var(--border-color);
         }
         
         .card:hover {
             transform: translateY(-5px);
             box-shadow: 0 10px 20px rgba(0,0,0,0.1);
         }
+
+        .medflow-navbar {
+            background-color: var(--navbar-bg) !important;
+            color: var(--navbar-text) !important;
+            border-bottom: 1px solid var(--border-color);
+            backdrop-filter: blur(12px);
+        }
+
+        .medflow-navbar .nav-link,
+        .medflow-navbar .navbar-brand {
+            color: var(--navbar-text) !important;
+        }
+
+        .medflow-navbar .brand-title {
+            color: var(--accent-color) !important;
+        }
+
+        .medflow-navbar .brand-subtitle {
+            color: var(--navbar-muted) !important;
+        }
+
+        .medflow-navbar .navbar-toggler {
+            border-color: var(--border-color);
+        }
+
+        html[data-theme='dark'] .medflow-navbar .navbar-toggler-icon {
+            filter: invert(1) brightness(1.4);
+        }
+
+        .navbar,
+        .modal-content,
+        .dropdown-menu,
+        .chatbot-window,
+        .form-control,
+        .form-select,
+        .input-group-text {
+            background-color: var(--surface-bg);
+            color: var(--page-text);
+            border-color: var(--border-color);
+        }
+
+        .card-header,
+        .card-footer,
+        .modal-header,
+        .modal-footer,
+        .bg-white,
+        .bg-light,
+        .table-light,
+        .list-group-item,
+        .typing-indicator,
+        .suggested-question {
+            background-color: var(--surface-alt) !important;
+            color: var(--page-text) !important;
+            border-color: var(--border-color) !important;
+        }
+
+        .table {
+            color: var(--page-text);
+        }
+
+        .text-muted {
+            color: var(--muted-text) !important;
+        }
+
+        .language-selector,
+        .theme-selector {
+            min-width: 165px;
+        }
+
+        .language-select,
+        .theme-select {
+            min-width: 120px;
+            font-size: 0.85rem;
+            border-color: rgba(52, 152, 219, 0.35);
+            box-shadow: none !important;
+        }
+
+        footer.bg-dark {
+            background-color: var(--footer-bg) !important;
+            color: var(--footer-text) !important;
+        }
+
+        footer.bg-dark a {
+            color: var(--footer-link) !important;
+        }
         
         /* Mobile Optimizations */
         @media (max-width: 768px) {
             .navbar-brand {
                 font-size: 1.2rem;
+            }
+
+            .language-selector,
+            .theme-selector {
+                width: 100%;
+                margin-top: 10px;
             }
             
             .btn {
@@ -1278,13 +1858,12 @@ def get_base_html(title="Hospital Kiosk", content="", show_nav=True, show_chat=T
             right: 0;
             width: 380px;
             height: 550px;
-            background: white;
+            background: var(--surface-bg);
             border-radius: 20px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
             display: none;
             flex-direction: column;
             overflow: hidden;
-            border: 1px solid rgba(255,255,255,0.2);
+            border: 1px solid var(--border-color);
         }
         
         @media (max-width: 480px) {
@@ -1346,7 +1925,7 @@ def get_base_html(title="Hospital Kiosk", content="", show_nav=True, show_chat=T
             flex: 1;
             padding: 20px;
             overflow-y: auto;
-            background: #f8f9fa;
+            background: var(--page-bg);
         }
         
         .message {
@@ -1372,8 +1951,8 @@ def get_base_html(title="Hospital Kiosk", content="", show_nav=True, show_chat=T
         }
         
         .bot-message .message-content {
-            background: white;
-            border: 1px solid #e9ecef;
+            background: var(--surface-bg);
+            border: 1px solid var(--border-color);
             border-bottom-left-radius: 5px;
             box-shadow: 0 2px 5px rgba(0,0,0,0.05);
             font-size: 0.95rem;
@@ -1402,7 +1981,7 @@ def get_base_html(title="Hospital Kiosk", content="", show_nav=True, show_chat=T
         
         .message-time {
             font-size: 10px;
-            color: #adb5bd;
+            color: var(--muted-text);
             margin-top: 4px;
             padding: 0 4px;
         }
@@ -1414,8 +1993,8 @@ def get_base_html(title="Hospital Kiosk", content="", show_nav=True, show_chat=T
         
         .chatbot-input {
             padding: 20px;
-            background: white;
-            border-top: 1px solid #e9ecef;
+            background: var(--surface-bg);
+            border-top: 1px solid var(--border-color);
         }
         
         .suggested-questions {
@@ -1426,15 +2005,14 @@ def get_base_html(title="Hospital Kiosk", content="", show_nav=True, show_chat=T
         }
         
         .suggested-question {
-            background: #f0f2f5;
-            border: none;
+            border: 1px solid var(--border-color);
             border-radius: 20px;
             padding: 8px 15px;
             font-size: 12px;
             cursor: pointer;
             transition: all 0.3s ease;
             white-space: nowrap;
-            color: var(--dark-color);
+            color: var(--page-text);
         }
         
         .suggested-question:hover {
@@ -1458,9 +2036,9 @@ def get_base_html(title="Hospital Kiosk", content="", show_nav=True, show_chat=T
         .typing-indicator {
             display: flex;
             padding: 12px 16px;
-            background: white;
+            background: var(--surface-alt);
             border-radius: 18px;
-            border: 1px solid #e9ecef;
+            border: 1px solid var(--border-color);
             width: fit-content;
         }
         
@@ -1522,6 +2100,7 @@ def get_base_html(title="Hospital Kiosk", content="", show_nav=True, show_chat=T
         .status-waiting { background: var(--warning-color); color: white; }
         .status-in_progress { background: var(--primary-color); color: white; }
         .status-completed { background: var(--success-color); color: white; }
+        .status-scheduled { background: #6c757d; color: white; }
         .status-emergency { background: var(--danger-color); color: white; animation: pulse 2s infinite; }
         
         /* Doctor Dashboard Styles */
@@ -1536,6 +2115,7 @@ def get_base_html(title="Hospital Kiosk", content="", show_nav=True, show_chat=T
         .patient-status-waiting { border-left: 5px solid #f39c12; }
         .patient-status-in_progress { border-left: 5px solid #3498db; }
         .patient-status-completed { border-left: 5px solid #2ecc71; }
+        .patient-status-scheduled { border-left: 5px solid #6c757d; }
         .patient-status-emergency { 
             border-left: 5px solid #e74c3c; 
             background-color: #ffeaea;
@@ -1572,6 +2152,18 @@ def get_base_html(title="Hospital Kiosk", content="", show_nav=True, show_chat=T
         .chatbot-container {
             z-index: 9999;
         }
+
+        .language-selector {
+            min-width: 165px;
+        }
+
+        .language-select {
+            min-width: 120px;
+            font-size: 0.85rem;
+            border-color: rgba(52, 152, 219, 0.35);
+            box-shadow: none !important;
+        }
+
     </style>
     '''
     
@@ -1582,6 +2174,7 @@ def get_base_html(title="Hospital Kiosk", content="", show_nav=True, show_chat=T
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=yes">
     <title>{title} - Smart Hospital Kiosk</title>
+    {theme_init_script}
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     {responsive_css}
@@ -1635,7 +2228,7 @@ def get_base_html(title="Hospital Kiosk", content="", show_nav=True, show_chat=T
                     <p class="small text-white-50 mb-2"><i class="fas fa-map-marker-alt me-3 text-primary"></i> 123 Healthcare Blvd, Medical District</p>
                     <p class="small text-white-50 mb-2"><i class="fas fa-envelope me-3 text-primary"></i> medflowkiosk@support.com</p>
                     <p class="small text-white-50 mb-2"><i class="fas fa-phone me-3 text-primary"></i> +91 88123 56789</p>
-                    <p class="small text-white-50 mb-0"><i class="fas fa-ambulance me-3 text-danger"></i> Emergency Hotline: <strong>112</strong></p>
+                    <p class="small text-white-50 mb-0"><i class="fas fa-ambulance me-3 text-danger"></i> Emergency Hotline: <a href="tel:112" class="text-white-50 text-decoration-none hover-text-white"><strong>112</strong></a></p>
                     
                     <div class="mt-4">
                         <span class="badge bg-primary px-3 py-2">Open 24/7</span>
@@ -1663,6 +2256,7 @@ def get_base_html(title="Hospital Kiosk", content="", show_nav=True, show_chat=T
     
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     {chat_js}
+    {translation_js}
     
     <script>
         // Highlighting Active Navigation Link
@@ -1687,10 +2281,10 @@ def get_base_html(title="Hospital Kiosk", content="", show_nav=True, show_chat=T
             }}, 30000);
         }}
         
-        // Auto-dismiss alerts after 5 seconds
+        // Auto-dismiss flash messages after 5 seconds
         document.addEventListener('DOMContentLoaded', function() {{
             setTimeout(function() {{
-                const alerts = document.querySelectorAll('.alert');
+                const alerts = document.querySelectorAll('.flash-message');
                 alerts.forEach(alert => {{
                     const bsAlert = new bootstrap.Alert(alert);
                     bsAlert.close();
@@ -1940,14 +2534,15 @@ def get_registration_info():
         "   • Aadhaar number (**Strict 12 digits, No spaces/hyphens**)\n" +
         "3. Select your department from available options\n" +
         "4. Choose consultation type (General/Specialist)\n" +
-        "5. **Face Registration**: Our system now uses eye-detection to align your photo automatically!\n" +
-        "6. Submit the form",
+        "5. Choose your consultation date\n" +
+        "6. **Face Registration**: Our system now uses eye-detection to align your photo automatically!\n" +
+        "7. Submit the form. The system predicts your consultation time automatically from the queue.",
         
         "After registration, you'll receive:\n" +
         "✅ Unique Patient ID (e.g., PAT12345678)\n" +
         "✅ Queue Number (e.g., CAR001)\n" +
         "✅ Department assignment\n" +
-        "✅ Check-in time\n" +
+        "✅ Estimated consultation time\n" +
         "✅ Login credentials (Patient ID as username/password)"
     ]
 
@@ -2082,6 +2677,17 @@ def get_queue_info(message):
         patient = Patient.query.filter_by(patient_id=patient_id).first()
         
         if patient:
+            if patient.status == 'scheduled':
+                return [
+                    f"📅 **Appointment Status for {patient.name}**\n\n" +
+                    f"Patient ID: {patient.patient_id}\n" +
+                    f"Department: {patient.department}\n" +
+                    f"Status: {patient.status.upper()}\n" +
+                    f"Consultation Date: {format_consultation_date(patient.consultation_date)}\n" +
+                    f"Estimated Consultation Time: {format_consultation_time(patient.consultation_time)}\n" +
+                    "Queue Number: Will be assigned on arrival"
+                ]
+
             # Get queue position
             queue_position = Patient.query.filter(
                 Patient.department == patient.department,
@@ -2089,7 +2695,7 @@ def get_queue_info(message):
                 Patient.check_in_time < patient.check_in_time
             ).count() + 1
             
-            wait_time = queue_position * 15  # Assume 15 minutes per patient
+            wait_time = queue_position * get_consultation_slot_minutes()
             
             return [
                 f"📊 **Queue Status for {patient.name}**\n\n" +
@@ -2098,6 +2704,7 @@ def get_queue_info(message):
                 f"Department: {patient.department}\n" +
                 f"Status: {patient.status.upper()}\n" +
                 f"Position in Queue: {queue_position}\n" +
+                f"Estimated Consultation Time: {format_consultation_time(patient.consultation_time)}\n" +
                 f"Estimated Wait Time: {wait_time} minutes"
             ]
     
@@ -2469,7 +3076,7 @@ def index():
                     <i class="fas fa-ambulance fa-2x me-md-3 mb-2 mb-md-0"></i>
                     <div class="text-center text-md-start">
                         <h5 class="alert-heading mb-1">Emergency?</h5>
-                        <p class="mb-0">Proceed directly to Emergency Department or call 112</p>
+                        <p class="mb-0">Proceed directly to Emergency Department or call <a href="tel:112" class="fw-bold text-decoration-none" style="color: inherit;">112</a></p>
                     </div>
                 </div>
                 <div class="mt-3 text-center">
@@ -2707,6 +3314,52 @@ def admin_dashboard():
     waiting_patients = Patient.query.filter_by(status='waiting').count()
     emergency_patients = Patient.query.filter_by(status='emergency').count()
     doctors = User.query.filter_by(role='doctor').all()
+    departments = Department.query.order_by(Department.name).all()
+
+    department_options = ''
+    for dept in departments:
+        department_name = html.escape(dept.name or '')
+        department_options += f'<option value="{department_name}">{department_name}</option>'
+    if not department_options:
+        department_options = '<option value="" selected disabled>No departments available</option>'
+
+    doctor_rows = ''
+    for doctor in doctors:
+        doctor_account_id = f'#{doctor.id}'
+        doctor_name = html.escape(doctor.full_name or doctor.username or 'Doctor')
+        doctor_username = html.escape(doctor.username or '')
+        doctor_department = html.escape(doctor.department or '-')
+        doctor_confirm_name = (doctor.full_name or doctor.username or 'this doctor').replace('\\', '\\\\').replace("'", "\\'")
+        doctor_rows += f'''
+                            <tr>
+                                <td><span class="badge bg-light text-dark border">{doctor_account_id}</span></td>
+                                <td>
+                                    <div class="fw-bold">{doctor_name}</div>
+                                </td>
+                                <td>
+                                    <code class="text-primary">{doctor_username}</code>
+                                </td>
+                                <td>{doctor_department}</td>
+                                <td>
+                                    <span class="badge bg-success">Active</span>
+                                </td>
+                                <td class="text-end">
+                                    <form method="POST" action="/admin/doctors/{doctor.id}/delete" class="d-inline" onsubmit="return confirm('Remove {doctor_confirm_name} from the hospital system?');">
+                                        <button type="submit" class="btn btn-outline-danger btn-sm">
+                                            <i class="fas fa-trash me-1"></i>Remove
+                                        </button>
+                                    </form>
+                                </td>
+                            </tr>
+        '''
+    if not doctor_rows:
+        doctor_rows = '''
+                            <tr>
+                                <td colspan="6" class="text-center text-muted py-4">
+                                    No doctors found. Add one using the form on the left.
+                                </td>
+                            </tr>
+        '''
     
     # Recent Patients
     recent_patients = Patient.query.order_by(Patient.check_in_time.desc()).limit(10).all()
@@ -2779,14 +3432,23 @@ def admin_dashboard():
                                         <th>Patient</th>
                                         <th>Department</th>
                                         <th>Status</th>
-                                        <th>Time</th>
+                                        <th>Time / Schedule</th>
                                     </tr>
                                 </thead>
                                 <tbody>
     '''
     
     for p in recent_patients:
-        status_color = 'danger' if p.status == 'emergency' else 'warning' if p.status == 'waiting' else 'info' if p.status == 'in_progress' else 'success'
+        if p.status == 'emergency':
+            status_color = 'danger'
+        elif p.status == 'waiting':
+            status_color = 'warning'
+        elif p.status == 'in_progress':
+            status_color = 'info'
+        elif p.status == 'scheduled':
+            status_color = 'secondary'
+        else:
+            status_color = 'success'
         content += f'''
                                     <tr>
                                         <td>
@@ -2795,11 +3457,11 @@ def admin_dashboard():
                                         </td>
                                         <td>{p.department}</td>
                                         <td><span class="badge bg-{status_color}">{p.status.upper()}</span></td>
-                                        <td>{p.check_in_time.strftime("%I:%M %p")}</td>
+                                        <td>{format_patient_service_time(p)}</td>
                                     </tr>
         '''
     
-    content += '''
+    content += f'''
                                 </tbody>
                             </table>
                         </div>
@@ -2810,25 +3472,55 @@ def admin_dashboard():
             <div class="col-12 col-xl-4">
                 <div class="card shadow-sm h-100">
                     <div class="card-header bg-white">
-                        <h5 class="mb-0">Active Doctors</h5>
+                        <h5 class="mb-0">Doctor Directory</h5>
+                        <small class="text-muted">View registered doctors and manage their access</small>
                     </div>
                     <div class="card-body">
-                        <ul class="list-group list-group-flush">
-    '''
-    
-    for d in doctors:
-        content += f'''
-                            <li class="list-group-item d-flex justify-content-between align-items-center">
-                                <div>
-                                    <div class="fw-bold">{d.full_name}</div>
-                                    <small class="text-muted">{d.department}</small>
+                        <form method="POST" action="/admin/doctors/add" class="mb-4">
+                            <div class="row g-2">
+                                <div class="col-12">
+                                    <label class="form-label small mb-1">Full Name</label>
+                                    <input type="text" class="form-control form-control-sm" name="full_name" placeholder="Dr. Jane Doe" required>
                                 </div>
-                                <span class="badge bg-success rounded-pill">Active</span>
-                            </li>
-        '''
-        
-    content += '''
-                        </ul>
+                                <div class="col-12 col-md-6">
+                                    <label class="form-label small mb-1">Username</label>
+                                    <input type="text" class="form-control form-control-sm" name="username" placeholder="dr_jane" required>
+                                </div>
+                                <div class="col-12 col-md-6">
+                                    <label class="form-label small mb-1">Password</label>
+                                    <input type="password" class="form-control form-control-sm" name="password" placeholder="Set password" required>
+                                </div>
+                                <div class="col-12">
+                                    <label class="form-label small mb-1">Department</label>
+                                    <select class="form-select form-select-sm" name="department" required>
+                                        <option value="" selected disabled>Select department</option>
+                                        {department_options}
+                                    </select>
+                                </div>
+                                <div class="col-12 d-grid mt-1">
+                                    <button type="submit" class="btn btn-primary btn-sm">
+                                        <i class="fas fa-user-plus me-1"></i>Add Doctor
+                                    </button>
+                                </div>
+                            </div>
+                        </form>
+                        <div class="table-responsive">
+                            <table class="table table-sm align-middle mb-0">
+                                <thead class="table-light">
+                                    <tr>
+                                        <th>ID</th>
+                                        <th>Name</th>
+                                        <th>Username</th>
+                                        <th>Department</th>
+                                        <th>Status</th>
+                                        <th class="text-end">Action</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {doctor_rows}
+                                </tbody>
+                            </table>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -2837,6 +3529,66 @@ def admin_dashboard():
     '''
     
     return get_base_html("Admin Dashboard", content, show_chat=False)
+
+@app.route('/admin/doctors/add', methods=['POST'])
+@admin_required
+def admin_add_doctor():
+    """Create a new doctor account from the admin dashboard."""
+    full_name = request.form.get('full_name', '').strip()
+    username = request.form.get('username', '').strip().lower()
+    password = request.form.get('password', '')
+    department = request.form.get('department', '').strip()
+
+    if not full_name or not username or not password or not department:
+        flash('All doctor fields are required.', 'danger')
+        return redirect(url_for('admin_dashboard'))
+
+    if len(password) < 6:
+        flash('Doctor password must be at least 6 characters long.', 'danger')
+        return redirect(url_for('admin_dashboard'))
+
+    if not Department.query.filter_by(name=department).first():
+        flash('Please select a valid department.', 'danger')
+        return redirect(url_for('admin_dashboard'))
+
+    existing_user = User.query.filter_by(username=username).first()
+    if existing_user:
+        flash('That username already exists. Choose a different username.', 'danger')
+        return redirect(url_for('admin_dashboard'))
+
+    doctor = User(
+        username=username,
+        full_name=full_name,
+        department=department,
+        role='doctor'
+    )
+    doctor.set_password(password)
+    db.session.add(doctor)
+    db.session.commit()
+
+    flash(f'Doctor {html.escape(full_name)} added successfully.', 'success')
+    return redirect(url_for('admin_dashboard'))
+
+
+@app.route('/admin/doctors/<int:doctor_id>/delete', methods=['POST'])
+@admin_required
+def admin_delete_doctor(doctor_id):
+    """Remove a doctor account from the system."""
+    doctor = db.session.get(User, doctor_id)
+    if doctor is None:
+        flash('Doctor not found.', 'danger')
+        return redirect(url_for('admin_dashboard'))
+
+    if doctor.role != 'doctor':
+        flash('Only doctor accounts can be removed from this panel.', 'danger')
+        return redirect(url_for('admin_dashboard'))
+
+    doctor_name = doctor.full_name or doctor.username
+    db.session.delete(doctor)
+    db.session.commit()
+
+    flash(f'Doctor {html.escape(doctor_name)} removed successfully.', 'success')
+    return redirect(url_for('admin_dashboard'))
 
 @app.route('/doctor/dashboard')
 @doctor_required
@@ -2858,8 +3610,10 @@ def doctor_dashboard():
             (Patient.status == 'emergency', 1),
             (Patient.status == 'in_progress', 2),
             (Patient.status == 'waiting', 3),
+            (Patient.status == 'scheduled', 4),
             else_=4
         ),
+        Patient.consultation_date,
         Patient.check_in_time
     ).all()
     
@@ -2913,7 +3667,7 @@ def doctor_dashboard():
                                     <th>Patient</th>
                                     <th class="d-none d-md-table-cell">Age/Gender</th>
                                     <th class="d-none d-lg-table-cell">Visit Type</th>
-                                    <th class="d-none d-sm-table-cell">Time</th>
+                                    <th class="d-none d-sm-table-cell">Time / Schedule</th>
                                     <th>Status</th>
                                     <th>Actions</th>
                                 </tr>
@@ -2922,7 +3676,8 @@ def doctor_dashboard():
         '''
         
         for patient in patients:
-            wait_time = (datetime.datetime.utcnow() - patient.check_in_time).seconds // 60
+            queue_display = patient.queue_number or 'TBD'
+            service_time_display = format_patient_service_time(patient)
             
             # Determine status badge color
             if patient.status == 'emergency':
@@ -2934,6 +3689,9 @@ def doctor_dashboard():
             elif patient.status == 'waiting':
                 status_badge = 'warning'
                 status_text = 'WAITING'
+            elif patient.status == 'scheduled':
+                status_badge = 'secondary'
+                status_text = 'SCHEDULED'
             else:
                 status_badge = 'success'
                 status_text = 'COMPLETED'
@@ -2944,14 +3702,14 @@ def doctor_dashboard():
             
             content += f'''
                                 <tr class="{'current-consultation' if is_current_patient else ''}">
-                                    <td><strong>{patient.queue_number}</strong></td>
+                                    <td><strong>{queue_display}</strong></td>
                                     <td>
                                         {patient.name}
                                         <small class="d-block d-md-none text-muted">{patient.age}/{patient.gender}</small>
                                     </td>
                                     <td class="d-none d-md-table-cell">{patient.age}/{patient.gender}</td>
                                     <td class="d-none d-lg-table-cell">{patient.consultation_type.replace('-', ' ').title()}</td>
-                                    <td class="d-none d-sm-table-cell">{patient.check_in_time.strftime("%I:%M %p")}</td>
+                                    <td class="d-none d-sm-table-cell">{service_time_display}</td>
                                     <td>
                                         <span class="badge bg-{status_badge}">{status_text}</span>
                                         {f'<br><small class="d-none d-md-inline">Dr. {patient.doctor_assigned}</small>' if patient.doctor_assigned else ''}
@@ -3021,6 +3779,10 @@ def doctor_dashboard():
             elif patient.status == 'completed':
                 content += f'''
                                             <span class="text-muted small">Completed</span>
+                '''
+            elif patient.status == 'scheduled':
+                content += f'''
+                                            <span class="text-muted small">Scheduled for {format_consultation_date(patient.consultation_date)}</span>
                 '''
             
             content += '''
@@ -3162,15 +3924,15 @@ def doctor_dashboard():
     
     <script>
         function confirmEmergency(patientName) {
-            return confirm(`Declare EMERGENCY for ${patientName}?`);
+            return window.localizeHospitalConfirm ? window.localizeHospitalConfirm('confirm_emergency', { name: patientName }) : confirm(`Declare EMERGENCY for ${patientName}?`);
         }
         
         function confirmEnd(patientName) {
-            return confirm(`END consultation with ${patientName}?`);
+            return window.localizeHospitalConfirm ? window.localizeHospitalConfirm('confirm_end', { name: patientName }) : confirm(`END consultation with ${patientName}?`);
         }
         
         function confirmComplete(patientName) {
-            return confirm(`COMPLETE consultation with ${patientName}?`);
+            return window.localizeHospitalConfirm ? window.localizeHospitalConfirm('confirm_complete', { name: patientName }) : confirm(`COMPLETE consultation with ${patientName}?`);
         }
         
         setInterval(() => {
@@ -3310,8 +4072,24 @@ def register():
         print(f"  Captured Face ID: {request.form.get('captured_face_id')}")
         print(f"  Face Descriptor (first 50 chars): {str(request.form.get('face_descriptor'))[:50]}")
         try:
-            # Generate patient ID
-            patient_id = f"PAT{str(uuid.uuid4())[:8].upper()}"
+            consultation_date = parse_consultation_date(request.form['consultation_date'])
+            today = datetime.date.today()
+            if consultation_date < today:
+                raise ValueError("Consultation date cannot be in the past.")
+
+            is_future_consultation = consultation_date > today
+            patient_status = 'scheduled' if is_future_consultation else 'waiting'
+            consultation_time, queue_position = estimate_consultation_slot(
+                request.form['department'],
+                consultation_date
+            )
+            queue_number = (
+                None
+                if is_future_consultation
+                else f"{request.form['department'][:3].upper()}{Patient.query.count() + 1:03d}"
+            )
+            check_in_time = None if is_future_consultation else datetime.datetime.utcnow()
+
             # Get face data from Temporary table or form
             face_descriptor = None
             face_image = None
@@ -3330,35 +4108,118 @@ def register():
                 # Fallback to direct inputs if available
                 face_descriptor = request.form.get('face_descriptor')
                 face_image = request.form.get('face_image')
-            
-            # Create patient
-            patient = Patient(
-                patient_id=patient_id,
-                name=request.form['name'],
-                age=int(request.form['age']),
-                gender=request.form['gender'],
-                phone=request.form['phone'],
-                email=request.form.get('email', ''),
+
+            existing_patient_id = request.form.get('existing_patient_id', '').strip()
+            existing_patient, identity_source = _find_existing_patient_for_registration(
+                existing_patient_id=existing_patient_id,
                 aadhaar_number=request.form.get('aadhaar_number', ''),
-                department=request.form['department'],
-                consultation_type=request.form['consultation_type'],
-                queue_number=f"{request.form['department'][:3].upper()}{Patient.query.count() + 1:03d}",
+                phone=request.form.get('phone', ''),
                 face_descriptor=face_descriptor,
-                face_image=face_image
+                name=request.form.get('name', '')
             )
-            
+
+            returning_patient = existing_patient is not None
+            if returning_patient:
+                patient = existing_patient
+                patient_id = patient.patient_id
+                patient.name = request.form['name']
+                patient.age = int(request.form['age'])
+                patient.gender = request.form['gender']
+                patient.phone = request.form['phone']
+                patient.email = request.form.get('email', '')
+                patient.aadhaar_number = request.form.get('aadhaar_number', '')
+                patient.department = request.form['department']
+                patient.consultation_type = request.form['consultation_type']
+                patient.consultation_date = consultation_date
+                patient.consultation_time = consultation_time
+                patient.queue_number = queue_number
+                patient.check_in_time = check_in_time
+                patient.status = patient_status
+                patient.doctor_assigned = None
+                patient.completion_time = None
+                if face_descriptor is not None:
+                    patient.face_descriptor = face_descriptor
+                if face_image is not None:
+                    patient.face_image = face_image
+            else:
+                # Generate a new patient ID only for a brand-new patient
+                patient_id = f"PAT{str(uuid.uuid4())[:8].upper()}"
+                patient = Patient(
+                    patient_id=patient_id,
+                    name=request.form['name'],
+                    age=int(request.form['age']),
+                    gender=request.form['gender'],
+                    phone=request.form['phone'],
+                    email=request.form.get('email', ''),
+                    aadhaar_number=request.form.get('aadhaar_number', ''),
+                    department=request.form['department'],
+                    consultation_type=request.form['consultation_type'],
+                    consultation_date=consultation_date,
+                    consultation_time=consultation_time,
+                    queue_number=queue_number,
+                    check_in_time=check_in_time,
+                    status=patient_status,
+                    face_descriptor=face_descriptor,
+                    face_image=face_image
+                )
+                db.session.add(patient)
+
             print(f"[DEBUG] Aadhaar number received: '{request.form.get('aadhaar_number', 'NOT RECEIVED')}'")
-            
-            db.session.add(patient)
-            
-            # Create user account
-            user = User(username=patient_id, role='patient')
-            user.set_password(patient_id)
-            db.session.add(user)
-            db.session.flush()
-            
-            patient.user_id = user.id
+            print(f"[DEBUG] Returning patient: {returning_patient}  source={identity_source or 'new'}  patient_id={patient_id}")
+
+            user = User.query.get(patient.user_id) if patient.user_id else None
+            if user is None:
+                user = User(username=patient_id, role='patient', full_name=patient.name, department=patient.department)
+                user.set_password(patient_id)
+                db.session.add(user)
+                db.session.flush()
+                patient.user_id = user.id
+            else:
+                user.username = patient_id
+                user.role = 'patient'
+                user.full_name = patient.name
+                user.department = patient.department
+
             db.session.commit()
+
+            consultation_date_text = format_consultation_date(patient.consultation_date)
+            consultation_time_text = format_consultation_time(patient.consultation_time)
+            queue_label = "Appointment Status" if is_future_consultation else "Queue Number"
+            queue_value = "Scheduled" if is_future_consultation else (patient.queue_number or "Pending")
+            timing_line = (
+                f"<p><strong>Consultation Date:</strong> {consultation_date_text}</p>"
+                f"<p><strong>Estimated Consultation Time:</strong> {consultation_time_text}</p>"
+                f"<p><strong>Estimated Queue Position:</strong> {queue_position}</p>"
+                f"<p><strong>Status:</strong> {patient.status.replace('_', ' ').title()}</p>"
+                f"<p><strong>Queue Number:</strong> Will be assigned on the consultation day.</p>"
+                if is_future_consultation else
+                f"<p><strong>Consultation Date:</strong> {consultation_date_text}</p>"
+                f"<p><strong>Estimated Consultation Time:</strong> {consultation_time_text}</p>"
+                f"<p><strong>Queue Position:</strong> {queue_position}</p>"
+                f"<p><strong>Check-in Time:</strong> {patient.check_in_time.strftime('%I:%M %p')}</p>"
+            )
+            secondary_action = (
+                '<a href="/queue" class="btn btn-outline-primary">Check Queue Status</a>'
+                if not is_future_consultation else
+                '<a href="/navigation" class="btn btn-outline-primary">View Hospital Navigation</a>'
+            )
+            sms_result = {'sent': False, 'reason': 'not_attempted'}
+            try:
+                sms_result = send_registration_sms(patient)
+                print(f"[SMS] Registration SMS result for {patient.patient_id}: {sms_result}")
+            except Exception as sms_error:
+                sms_result = {'sent': False, 'reason': str(sms_error)}
+                print(f"[SMS] Failed to send registration SMS for {patient.patient_id}: {sms_error}")
+
+            sms_reason = sms_result.get('reason', 'unknown')
+            sms_alert = (
+                f'<div class="alert alert-success mt-3 mb-0"><i class="fas fa-sms me-2"></i>'
+                f'Confirmation SMS sent to {patient.phone}.</div>'
+                if sms_result.get('sent') else
+                f'<div class="alert alert-warning mt-3 mb-0"><i class="fas fa-exclamation-circle me-2"></i>'
+                f'Registration saved, but SMS confirmation could not be sent right now.'
+                f'<br><small class="text-muted">Reason: {sms_reason}</small></div>'
+            )
             
             # Success page
             success_content = f'''
@@ -3373,19 +4234,20 @@ def register():
                                 <h3 class="text-primary text-break">{patient_id}</h3>
                             </div>
                             <div class="col-12 col-md-6">
-                                <p><strong>Queue Number:</strong></p>
-                                <h3 class="text-primary">{patient.queue_number}</h3>
+                                <p><strong>{queue_label}:</strong></p>
+                                <h3 class="text-primary">{queue_value}</h3>
                             </div>
                         </div>
                         <div class="mt-3">
                             <p><strong>Department:</strong> {patient.department}</p>
                             <p><strong>Aadhaar Number:</strong> {patient.aadhaar_number if patient.aadhaar_number else 'Not Provided'}</p>
-                            <p><strong>Check-in Time:</strong> {patient.check_in_time.strftime('%I:%M %p')}</p>
+                            {timing_line}
                         </div>
                         <div class="mt-4 d-grid d-md-block">
                             <a href="/" class="btn btn-primary me-md-2 mb-2 mb-md-0">Return to Home</a>
-                            <a href="/queue" class="btn btn-outline-primary">Check Queue Status</a>
+                            {secondary_action}
                         </div>
+                        {sms_alert}
                     </div>
                 </div>
             </div>
@@ -3409,6 +4271,7 @@ def register():
 
     # GET request - show registration form
     departments = Department.query.all()
+    today_iso = datetime.date.today().isoformat()
 
     dept_options = ""
     for dept in departments:
@@ -3420,7 +4283,7 @@ def register():
         <div class="col-12 col-lg-8">
             <div class="mb-4">
                 <h2 class="text-center mb-4"><i class="fas fa-user-plus me-2"></i>Patient Registration</h2>
-                <p class="text-center text-muted">Complete both steps below to register</p>
+                <p class="text-center text-muted">Complete both steps below to register and choose your consultation date</p>
             </div>
 
             <!-- STEP 1: Face Capture -->
@@ -3475,6 +4338,7 @@ def register():
                         <input type="hidden" name="captured_face_id" id="capturedFaceIdInput">
                         <input type="hidden" name="face_descriptor" id="faceDescriptorInput">
                         <input type="hidden" name="face_image" id="faceImageInput">
+                        <input type="hidden" name="existing_patient_id" id="existingPatientIdInput">
                         <div class="row g-3" id="personalDetailsSection">
                             <div class="col-12">
                                 <label class="form-label">Full Name *</label>
@@ -3517,7 +4381,7 @@ def register():
                         </div> <!-- End of personalDetailsSection -->
 
                         <div class="row g-3 mt-1">
-                            <div class="col-12 col-md-6">
+                            <div class="col-12 col-md-4">
                                 <label class="form-label">Department *</label>
                                 <select class="form-select" name="department" required id="departmentSelect">
                                     <option value="">Select Department</option>
@@ -3525,13 +4389,19 @@ def register():
                                 </select>
                             </div>
 
-                            <div class="col-12 col-md-6">
+                            <div class="col-12 col-md-4">
                                 <label class="form-label">Visit Type *</label>
                                 <select class="form-select" name="consultation_type" required>
                                     <option value="">Select Type</option>
                                     <option value="new">New Consultation</option>
                                     <option value="follow-up">Follow-up Visit</option>
                                 </select>
+                            </div>
+
+                            <div class="col-12 col-md-4">
+                                <label class="form-label">Consultation Date *</label>
+                                <input type="date" class="form-control" name="consultation_date" id="consultationDateInput" required min="{today_iso}" value="{today_iso}">
+                                <div class="form-text">Choose today for immediate check-in or a future date to schedule the visit. Estimated consultation time will be assigned automatically from the queue.</div>
                             </div>
                         </div>
 
@@ -3576,7 +4446,7 @@ def register():
                     <div class="card text-center p-2">
                         <i class="fas fa-ambulance text-danger mb-2"></i>
                         <h6 class="mb-0">Emergency</h6>
-                        <small>Call 112</small>
+                        <small><a href="tel:112" class="text-danger text-decoration-none fw-semibold">Call 112</a></small>
                     </div>
                 </div>
             </div>
@@ -3627,7 +4497,7 @@ def register():
             const phone = document.querySelector('input[name="phone"]').value;
             if (!/^\\d{{10}}$/.test(phone)) {{
                 e.preventDefault();
-                alert('Please enter a valid 10-digit phone number');
+                if (window.localizeHospitalAlert) {{ window.localizeHospitalAlert('invalid_phone'); }} else {{ alert('Please enter a valid 10-digit phone number'); }}
                 return;
             }}
             
@@ -3635,8 +4505,16 @@ def register():
             const aadhaar = document.getElementById('aadhaarInput').value;
             if (aadhaar && aadhaar.length !== 12) {{
                 e.preventDefault();
-                alert('Aadhaar number must be exactly 12 digits');
+                if (window.localizeHospitalAlert) {{ window.localizeHospitalAlert('invalid_aadhaar'); }} else {{ alert('Aadhaar number must be exactly 12 digits'); }}
                 document.getElementById('aadhaarInput').focus();
+                return;
+            }}
+
+            const consultationDateInput = document.getElementById('consultationDateInput');
+            if (!consultationDateInput.value || consultationDateInput.value < consultationDateInput.min) {{
+                e.preventDefault();
+                if (window.localizeHospitalAlert) {{ window.localizeHospitalAlert('invalid_date'); }} else {{ alert('Please choose a valid consultation date.'); }}
+                consultationDateInput.focus();
                 return;
             }}
             
@@ -3644,7 +4522,7 @@ def register():
             const faceDescriptor = document.getElementById('faceDescriptorInput').value;
             if (!faceDescriptor) {{
                 e.preventDefault();
-                alert('Please capture your face before registering');
+                if (window.localizeHospitalAlert) {{ window.localizeHospitalAlert('face_missing'); }} else {{ alert('Please capture your face before registering'); }}
                 return;
             }}
         }});
@@ -3654,11 +4532,16 @@ def register():
         let animationFrameId = null;
         
         // Display messages to user
-        function handleMessage(message, type = 'info') {{
+        async function handleMessage(message, type = 'info') {{
             const faceMessage = document.getElementById('faceMessage');
             if (faceMessage) {{
-                faceMessage.innerHTML = message;
-                faceMessage.className = `alert alert-${{type}} small mt-2`;
+                faceMessage.className = `alert alert-${{type}} small mt-2 notranslate`;
+                faceMessage.setAttribute('translate', 'no');
+                faceMessage.dataset.originalMessage = message;
+                const targetLanguage = window.getHospitalLanguage ? window.getHospitalLanguage() : 'en';
+                faceMessage.innerHTML = window.translateHospitalTextAsync
+                    ? await window.translateHospitalTextAsync(message, targetLanguage)
+                    : message;
                 faceMessage.style.display = 'block';
             }} else {{
                 console.log("Face Message: " + message);
@@ -3785,6 +4668,10 @@ def register():
                 
                 handleMessage('Detecting face...', 'info');
                 document.getElementById('captureFaceBtn').disabled = true;
+                const existingPatientInput = document.getElementById('existingPatientIdInput');
+                if (existingPatientInput) {{
+                    existingPatientInput.value = '';
+                }}
                 
                 // Send image to backend for face detection
                 const response = await fetch('/api/register/detect-face', {{
@@ -3851,6 +4738,9 @@ def register():
                     
                     if (matchData.found) {{
                         const patient = matchData.patient;
+                        if (existingPatientInput) {{
+                            existingPatientInput.value = patient.id;
+                        }}
                         faceStatus.innerHTML = `<i class="fas fa-user-check me-2"></i>Welcome back, <strong>${{patient.name}}</strong>! Profile loaded.`;
                         faceStatus.className = 'alert alert-info small';
                         
@@ -3873,19 +4763,26 @@ def register():
                         document.querySelector('input[name="phone"]').value = patient.phone;
                         document.querySelector('input[name="email"]').value = patient.email || '';
                         
-                        handleMessage(`Welcome back ${{patient.name}}! Please select the department you are visiting today.`, 'success');
+                        handleMessage(`Welcome back ${{patient.name}}! Please select the department and consultation date for this visit.`, 'success');
                     }} else {{
+                        if (existingPatientInput) {{
+                            existingPatientInput.value = '';
+                        }}
                         faceStatus.innerHTML = `<i class="fas fa-user-plus me-2"></i>New profile. Please complete the registration.`;
                         if(personalSection) personalSection.style.display = 'flex';
                         if(headerText) headerText.innerHTML = `<i class="fas fa-file-alt me-2"></i>Step 2: New Patient Details`;
                         if(submitText) submitText.textContent = "Complete Registration";
-                        handleMessage('New patient detected. Please fill in your details.', 'info');
+                        handleMessage('New patient detected. Please fill in your details and choose a consultation date.', 'info');
                     }}
                     
                     // Always scroll to step 2 afterward
                     if (step2Card) step2Card.scrollIntoView({{behavior: 'smooth', block: 'start'}});
                 }} catch (matchErr) {{
                     console.error('Match error:', matchErr);
+                    const existingPatientInput = document.getElementById('existingPatientIdInput');
+                    if (existingPatientInput) {{
+                        existingPatientInput.value = '';
+                    }}
                     const personalSection = document.getElementById('personalDetailsSection');
                     if(personalSection) personalSection.style.display = 'flex';
                     if (step2Card) step2Card.scrollIntoView({{behavior: 'smooth', block: 'start'}});
@@ -3905,6 +4802,10 @@ def register():
             faceCaptured = false;
             document.getElementById('faceDescriptorInput').value = '';
             document.getElementById('faceImageInput').value = '';
+            const existingPatientInput = document.getElementById('existingPatientIdInput');
+            if (existingPatientInput) {{
+                existingPatientInput.value = '';
+            }}
             
             // Reset UI
             document.getElementById('faceStatus').style.display = 'none';
@@ -3939,152 +4840,47 @@ def register():
 
 @app.route('/api/register/detect-face', methods=['POST'])
 def detect_face():
-    """Extract face embedding from uploaded image with high-accuracy alignment and multi-region LBP"""
+    """
+    Detect a face in the submitted webcam image and return its 512-D FaceNet
+    embedding.  Tries backends in order:
+      1. facenet-pytorch  (MTCNN → InceptionResNetV1 VGGFace2)
+      2. DeepFace Facenet512 + MTCNN detector
+      3. DeepFace Facenet512 + OpenCV detector (relaxed)
+      4. OpenCV Haar + pixel descriptor (512-D, last resort)
+    """
     try:
         data = request.get_json()
         if not data or 'image' not in data:
             return jsonify({'error': 'No image provided'}), 400
 
-        # Decode base64 image
-        image_data = data['image'].split(',')[1]  # Remove data:image/jpeg;base64,
-        image_bytes = base64.b64decode(image_data)
-        image = Image.open(io.BytesIO(image_bytes))
-        image_rgb = np.array(image.convert('RGB'))
-        
-        # Convert to BGR for OpenCV
-        if OPENCV_AVAILABLE:
-            image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-        else:
-            image_bgr = image_rgb[:, :, ::-1].copy()
+        raw_b64 = data['image']
+        if ',' in raw_b64:
+            raw_b64 = raw_b64.split(',', 1)[1]
+        image_bytes = base64.b64decode(raw_b64)
 
-        # Step 1: Face and Eye Alignment
-        if OPENCV_AVAILABLE:
-            try:
-                gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-                faces = FACE_CASCADE.detectMultiScale(gray, 1.1, 5, minSize=(30, 30))
-                
-                if len(faces) > 0:
-                    # Get largest face
-                    x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
-                    face_roi = gray[y:y+h, x:x+w]
-                    
-                    # Detect eyes within face for alignment
-                    eyes = EYE_CASCADE.detectMultiScale(face_roi, 1.1, 10, minSize=(15, 15))
-                    
-                    if len(eyes) >= 2:
-                        # Sort eyes by x position
-                        eyes = sorted(eyes, key=lambda e: e[0])
-                        (ex1, ey1, ew1, eh1) = eyes[0]
-                        (ex2, ey2, ew2, eh2) = eyes[1]
-                        
-                        # Calculate center of eyes
-                        p1 = (ex1 + ew1//2, ey1 + eh1//2)
-                        p2 = (ex2 + ew2//2, ey2 + eh2//2)
-                        
-                        # Calculate angle
-                        dy = p2[1] - p1[1]
-                        dx = p2[0] - p1[0]
-                        angle = np.degrees(np.arctan2(dy, dx))
-                        
-                        # Rotate image around center of eyes
-                        center = ((p1[0] + p2[0]) // 2 + x, (p1[1] + p2[1]) // 2 + y)
-                        M = cv2.getRotationMatrix2D(center, angle, 1.0)
-                        rotated = cv2.warpAffine(image_bgr, M, (image_bgr.shape[1], image_bgr.shape[0]))
-                        
-                        # Re-crop from rotated image
-                        image_bgr = rotated[y:y+h, x:x+w].copy()
-                        print(f"[FACE DETECT] Face aligned by {angle:.2f} degrees")
-                    else:
-                        image_bgr = image_bgr[y:y+h, x:x+w].copy()
-                        print("[FACE DETECT] Face detected but no eyes found for alignment")
-                else:
-                    return jsonify({'error': 'No face detected'}), 400
-            except Exception as e:
-                print(f"[FACE DETECT] Alignment error: {e}")
+        embedding, model_name = _extract_embedding_from_image_bytes(image_bytes)
 
-        # Step 2: Advanced Feature Extraction (Mathematical Fallback)
-        image_pil = Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
-        face_img = image_pil.resize((128, 128)).convert('L')
-        pixels = np.array(face_img).astype(np.float32) / 255.0
+        if embedding is None:
+            print("[FACE DETECT] All backends failed – no face extracted")
+            return jsonify({
+                'error': 'No face detected. Please face the camera squarely in good lighting and retry.'
+            }), 400
 
-        # Apply CLAHE for lighting normalization
-        if OPENCV_AVAILABLE:
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-            pixels = clahe.apply((pixels * 255).astype(np.uint8)).astype(np.float32) / 255.0
+        print(f"[FACE DETECT] OK  dim={len(embedding)}  model={model_name}")
 
-        features = []
-        
-        # 1. Global Structure (32x32) - 1024 features
-        low_res = np.array(Image.fromarray((pixels * 255).astype(np.uint8)).resize((32, 32))).flatten() / 255.0
-        features.extend(low_res)
-        
-        # 2. Multi-Region Detailed LBP (8x8 Grid) - 64 regions * 8 stats = 512 features
-        def get_lbp_stats(region):
-            lbp = np.zeros_like(region, dtype=np.uint8)
-            padded = np.pad(region, 1, mode='edge')
-            for i in range(1, padded.shape[0]-1):
-                for j in range(1, padded.shape[1]-1):
-                    c = padded[i,j]
-                    code = 0
-                    if padded[i-1,j-1] >= c: code |= 1
-                    if padded[i-1,j] >= c: code |= 2
-                    if padded[i-1,j+1] >= c: code |= 4
-                    if padded[i,j+1] >= c: code |= 8
-                    if padded[i+1,j+1] >= c: code |= 16
-                    if padded[i+1,j] >= c: code |= 32
-                    if padded[i+1,j-1] >= c: code |= 64
-                    if padded[i,j-1] >= c: code |= 128
-                    lbp[i-1,j-1] = code
-            return [np.mean(lbp)/255.0, np.std(lbp)/255.0]
-
-        for i in range(0, 128, 16):
-            for j in range(0, 128, 16):
-                region = pixels[i:i+16, j:j+16]
-                # Regional Intensity Stats
-                features.extend([np.mean(region), np.std(region), np.max(region), np.min(region)])
-                # Regional LBP Stats
-                features.extend(get_lbp_stats(region))
-
-        # 3. Shape Descriptors (Gradients) - 128x2 = 256 features
-        gx = ndimage.sobel(pixels, axis=1)
-        gy = ndimage.sobel(pixels, axis=0)
-        # Use 16x16 downsampled gradients
-        gx_small = np.array(Image.fromarray(gx).resize((16, 16))).flatten()
-        gy_small = np.array(Image.fromarray(gy).resize((16, 16))).flatten()
-        features.extend(gx_small / (np.max(np.abs(gx_small)) + 1e-8))
-        features.extend(gy_small / (np.max(np.abs(gy_small)) + 1e-8))
-        
-        # 4. Global Histogram - 32 features
-        hist, _ = np.histogram(pixels.flatten(), bins=32, range=(0, 1))
-        features.extend(hist / (np.sum(hist) + 1e-8))
-
-        # Pad to exactly 2048
-        embedding_arr = np.array(features, dtype=np.float32)
-        if len(embedding_arr) < 2048:
-            embedding_arr = np.pad(embedding_arr, (0, 2048 - len(embedding_arr)), mode='constant')
-        else:
-            embedding_arr = embedding_arr[:2048]
-        
-        # Final Norm
-        norm = np.linalg.norm(embedding_arr)
-        if norm > 0: embedding_arr /= norm
-        
-        embedding = embedding_arr.tolist()
-        
-        # Save to database
         captured_record = CapturedFace(
             face_descriptor=json.dumps(embedding),
-            face_image=image_data
+            face_image=raw_b64
         )
         db.session.add(captured_record)
         db.session.commit()
-        
+
         return jsonify({
             'success': True,
             'embedding': embedding,
             'captured_face_id': captured_record.id,
-            'model': 'RobustAlignedGridLBP',
-            'warning': 'Using eye-aligned multi-region detection for higher accuracy.'
+            'model': model_name,
+            'dimensions': len(embedding)
         })
 
     except Exception as e:
@@ -4093,159 +4889,133 @@ def detect_face():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
+
 @app.route('/api/register/match-face', methods=['POST'])
 def match_face():
-    """Match face embedding against existing patients with strict validation"""
+    """
+    1:N face identification against all registered patients.
+
+    Accepts a 512-D (or 128-D fallback) embedding and compares it via
+    cosine similarity against every stored patient descriptor.
+    Returns the best match if it clears the trained confidence gates, plus
+    full patient details so the kiosk can pre-fill the check-in form.
+    """
     try:
         data = request.get_json()
         if not data or 'embedding' not in data:
             return jsonify({'error': 'No embedding provided'}), 400
 
-        embedding = np.array(data['embedding'], dtype=np.float32)
-        if len(embedding) != 2048:
-            return jsonify({'error': f'Invalid embedding dimensions: {len(embedding)} != 2048'}), 400
+        probe = np.array(data['embedding'], dtype=np.float32)
+        probe_norm = np.linalg.norm(probe)
+        if probe_norm < 1e-6:
+            return jsonify({'error': 'Invalid (zero-norm) embedding received'}), 400
+        probe_unit = probe / probe_norm
+        probe_dim  = len(probe)
 
-        # Normalize the input embedding
-        embedding_norm = embedding / (np.linalg.norm(embedding) + 1e-8)
+        # ── Load trained thresholds (use safe defaults if model not yet trained) ─
+        cfg          = get_face_model_config()
+        COSINE_TH    = cfg['cosine_threshold']
+        EUCLIDEAN_TH = cfg['euclidean_threshold']
+        GAP_TH       = cfg['similarity_gap']
 
-        best_match = None
-        best_similarity = -2  # Start below minimum possible value
-        best_distance = float('inf')
-        second_best_similarity = -2
-        second_best_distance = float('inf')
-        
-        all_scores = []
-
-        # Check all patients with face data
-        patients = Patient.query.filter(Patient.face_descriptor.isnot(None)).all()
+        # ── 1:N exhaustive search ──────────────────────────────────────────
+        patients   = Patient.query.filter(Patient.face_descriptor.isnot(None)).all()
+        all_scores = []   # list of (cosine_sim, euclidean_dist, patient)
 
         for patient in patients:
             try:
-                stored_embedding = np.array(json.loads(patient.face_descriptor), dtype=np.float32)
-                if len(stored_embedding) != 2048:
-                    print(f"[FACE MATCH] Skipping patient {patient.id}: invalid embedding size {len(stored_embedding)}")
+                stored = np.array(json.loads(patient.face_descriptor), dtype=np.float32)
+                if len(stored) != probe_dim:   # skip incompatible embeddings
                     continue
-                
-                # Normalize stored embedding
-                stored_norm = stored_embedding / (np.linalg.norm(stored_embedding) + 1e-8)
+                sn = np.linalg.norm(stored)
+                if sn < 1e-6:
+                    continue
+                su = stored / sn
 
-                # Calculate multiple distance metrics
-                
-                # 1. Cosine similarity (ranges from -1 to 1)
-                cosine_sim = float(np.dot(embedding_norm, stored_norm))
-                
-                # 2. Euclidean distance (lower is better)
-                euclidean_dist = float(np.linalg.norm(embedding - stored_embedding))
-                
-                # 3. Manhattan distance
-                manhattan_dist = float(np.sum(np.abs(embedding - stored_embedding)))
-                
-                # 4. Chi-square distance (for histogram-like features)
-                chi_square = float(np.sum((embedding - stored_embedding) ** 2 / (np.abs(embedding) + np.abs(stored_embedding) + 1e-8)))
-                
-                # Composite score: prioritize cosine similarity but use other metrics for validation
-                # Higher is better
-                composite_score = cosine_sim - (euclidean_dist * 0.01)
-                
-                all_scores.append({
-                    'patient_id': patient.patient_id,
-                    'patient_name': patient.name,
-                    'cosine_similarity': cosine_sim,
-                    'euclidean_distance': euclidean_dist,
-                    'manhattan_distance': manhattan_dist,
-                    'chi_square': chi_square,
-                    'composite_score': composite_score
-                })
-
-                # Track best and second-best matches
-                if cosine_sim > best_similarity:
-                    second_best_similarity = best_similarity
-                    second_best_distance = best_distance
-                    best_similarity = cosine_sim
-                    best_distance = euclidean_dist
-                    best_match = patient
-                elif cosine_sim > second_best_similarity:
-                    second_best_similarity = cosine_sim
-                    second_best_distance = euclidean_dist
+                cos  = float(np.dot(probe_unit, su))
+                dist = float(np.linalg.norm(probe_unit - su))  # euclidean on unit vectors
+                all_scores.append((cos, dist, patient))
 
             except (json.JSONDecodeError, ValueError, TypeError) as e:
-                print(f"[FACE MATCH ERROR] Patient {patient.id}: {e}")
                 continue
 
-        # Debug logging
-        print(f"\n[FACE MATCH DEBUG]")
-        print(f"  Total patients checked: {len(all_scores)}")
-        if all_scores:
-            print(f"  Top 5 matches:")
-            for score in sorted(all_scores, key=lambda x: x['cosine_similarity'], reverse=True)[:5]:
-                print(f"    - {score['patient_name']}: cosine={score['cosine_similarity']:.4f}, euclidean={score['euclidean_distance']:.2f}")
+        all_scores.sort(key=lambda x: x[0], reverse=True)   # best cosine first
 
-        # Get trained model configuration
-        model_config = get_face_model_config()
-        COSINE_THRESHOLD = model_config['cosine_threshold']
-        EUCLIDEAN_THRESHOLD = model_config['euclidean_threshold']
-        SIMILARITY_GAP = model_config['similarity_gap']
-        
-        # Validation checks - RELAXED FOR BETTER ACCURACY WITH FALLBACK MODEL
-        # Priority 1: High Cosine Similarity (Excellent match)
-        is_excellent_match = best_similarity >= 0.85
-        
-        # Priority 2: Standard matching criteria
-        passed_cosine = best_similarity >= COSINE_THRESHOLD
-        passed_euclidean = best_distance <= EUCLIDEAN_THRESHOLD
-        passed_gap = (best_similarity - second_best_similarity) >= SIMILARITY_GAP
-        
-        print(f"\n[FACE MATCH VALIDATION]")
-        print(f"  Best cosine similarity: {best_similarity:.4f} (threshold: {COSINE_THRESHOLD:.4f}, passed: {passed_cosine})")
-        print(f"  Best euclidean distance: {best_distance:.2f} (threshold: {EUCLIDEAN_THRESHOLD:.2f}, passed: {passed_euclidean})")
-        print(f"  Similarity gap: {best_similarity - second_best_similarity:.4f} (threshold: {SIMILARITY_GAP:.4f}, passed: {passed_gap})")
+        print(f"\n[FACE MATCH] probe_dim={probe_dim}  candidates={len(all_scores)}")
+        for cos, dist, p in all_scores[:5]:
+            print(f"  {p.name:30s}  cosine={cos:.4f}  euclidean={dist:.4f}")
 
-        # Decision Logic:
-        # Match if it's excellent OR if it passes basic cosine/euclidean (gap is secondary)
-        should_match = best_match and (is_excellent_match or (passed_cosine and passed_euclidean))
-        
-        if should_match:
-            print(f"\n[FACE MATCH SUCCESS] Matched: {best_match.name}")
-            
+        if not all_scores:
+            return jsonify({'found': False,
+                            'message': 'No registered patients found in database.'})
+
+        best_cos, best_dist, best_patient = all_scores[0]
+        second_cos = all_scores[1][0] if len(all_scores) > 1 else -1.0
+        gap        = best_cos - second_cos
+
+        # ── Decision ───────────────────────────────────────────────────────
+        excellent  = best_cos >= FACE_MATCH_EXCELLENT_THRESHOLD   # Tier 1
+        std_cosine = best_cos >= COSINE_TH                        # Tier 2a
+        std_dist   = best_dist <= EUCLIDEAN_TH                    # Tier 2b
+        confirmed  = excellent or (std_cosine and std_dist)
+
+        print(f"  Thresholds  cosine>={COSINE_TH}  euclidean<={EUCLIDEAN_TH}  gap>={GAP_TH}")
+        print(f"  excellent={excellent}  cosine={std_cosine}  dist={std_dist}")
+        print(f"  RESULT: {'MATCH [OK]' if confirmed else 'NO MATCH [X]'}  ({best_patient.name})")
+
+        if confirmed:
+            p = best_patient
             return jsonify({
                 'found': True,
                 'patient': {
-                    'id': best_match.patient_id,
-                    'name': best_match.name,
-                    'age': best_match.age,
-                    'gender': best_match.gender,
-                    'phone': best_match.phone,
-                    'email': best_match.email,
-                    'department': best_match.department,
-                    'consultation_type': best_match.consultation_type
+                    'id':                p.patient_id,
+                    'name':              p.name,
+                    'age':               p.age,
+                    'gender':            p.gender,
+                    'phone':             p.phone,
+                    'email':             p.email or '',
+                    'aadhaar_number':    p.aadhaar_number or '',
+                    'department':        p.department,
+                    'consultation_type': p.consultation_type,
+                    'consultation_date': (
+                        p.consultation_date.strftime('%Y-%m-%d')
+                        if p.consultation_date else ''
+                    ),
+                    'consultation_time': (
+                        p.consultation_time.strftime('%H:%M')
+                        if p.consultation_time else ''
+                    ),
+                    'queue_number':      p.queue_number or '',
+                    'status':            p.status or 'waiting',
+                    'check_in_time':     (
+                        p.check_in_time.strftime('%Y-%m-%d %H:%M')
+                        if p.check_in_time else ''
+                    ),
                 },
                 'confidence': {
-                    'cosine_similarity': float(best_similarity),
-                    'euclidean_distance': float(best_distance),
-                    'similarity_gap': float(best_similarity - second_best_similarity)
+                    'cosine_similarity':  round(best_cos,  4),
+                    'euclidean_distance': round(best_dist, 4),
+                    'similarity_gap':     round(gap,       4),
+                    'is_excellent_match': excellent,
                 },
                 'matching_thresholds': {
-                    'cosine': COSINE_THRESHOLD,
-                    'euclidean': EUCLIDEAN_THRESHOLD,
-                    'gap': SIMILARITY_GAP
+                    'cosine':    COSINE_TH,
+                    'euclidean': EUCLIDEAN_TH,
+                    'gap':       GAP_TH,
                 }
             })
         else:
-            print(f"\n[FACE MATCH FAILED]")
-            print(f"  Cosine threshold not met: {best_similarity:.4f} < {COSINE_THRESHOLD}")
-            print(f"  Euclidean threshold not met: {best_distance:.2f} > {EUCLIDEAN_THRESHOLD}")
-            print(f"  Gap threshold not met: {best_similarity - second_best_similarity:.4f} < {SIMILARITY_GAP}")
-            
             return jsonify({
                 'found': False,
-                'best_similarity': float(best_similarity) if best_similarity != -2 else 0,
-                'best_distance': float(best_distance) if best_distance != float('inf') else 9999,
+                'best_similarity': round(best_cos,  4),
+                'best_distance':   round(best_dist, 4),
+                'similarity_gap':  round(gap,       4),
                 'matching_thresholds': {
-                    'cosine': COSINE_THRESHOLD,
-                    'euclidean': EUCLIDEAN_THRESHOLD,
-                    'gap': SIMILARITY_GAP
+                    'cosine':    COSINE_TH,
+                    'euclidean': EUCLIDEAN_TH,
+                    'gap':       GAP_TH,
                 },
-                'message': 'No matching patient found. New patient registration.'
+                'message': 'No matching patient found – please proceed with new registration.'
             })
 
     except Exception as e:
@@ -4253,6 +5023,7 @@ def match_face():
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
+
 
 @app.route('/queue')
 def queue_status():
@@ -4326,7 +5097,6 @@ def queue_status():
                     <div class="d-flex w-100 justify-content-between align-items-center">
                         <div>
                             <h6 class="mb-1">#{patient.queue_number}</h6>
-                            <p class="mb-1 small">{patient.name}</p>
                         </div>
                         <span class="badge bg-{status_class}">{status_text}</span>
                     </div>
@@ -4383,7 +5153,7 @@ def queue_status():
         function searchQueue() {
             const patientId = document.getElementById('queueSearch').value;
             if (patientId) {
-                alert('Please check the registration desk for your queue status, or use the chatbot for assistance.');
+                if (window.localizeHospitalAlert) {{ window.localizeHospitalAlert('queue_help'); }} else {{ alert('Please check the registration desk for your queue status, or use the chatbot for assistance.'); }}
             }
         }
     </script>
@@ -4687,7 +5457,8 @@ def navigation():
     
     <script>
         function showLocation(location) {
-            alert(`📍 ${location}\n\nPlease follow the signs or ask staff for directions. Use the chatbot for more details.`);
+            if (window.localizeHospitalAlert) {{ window.localizeHospitalAlert('location_help', {{ location }}); }}
+            else {{ alert(`📍 ${location}\n\nPlease follow the signs or ask staff for directions. Use the chatbot for more details.`); }}
         }
         
         function filterFloor(floor) {
@@ -4722,7 +5493,7 @@ def emergency():
                             <div class="card-body text-center py-4">
                                 <i class="fas fa-phone fa-3x text-danger mb-3"></i>
                                 <h3>Call Emergency</h3>
-                                <div class="display-1 text-danger my-3">112</div>
+                                <a href="tel:112" class="display-1 text-danger my-3 d-inline-block text-decoration-none" aria-label="Call 112">112</a>
                                 <p class="mb-0">Toll-free, 24/7</p>
                             </div>
                         </div>
@@ -4778,9 +5549,9 @@ def train_face_model_endpoint():
                 'success': True,
                 'message': 'Face model trained successfully',
                 'config': {
-                    'cosine_threshold': result.cosine_threshold,
-                    'euclidean_threshold': result.euclidean_threshold,
-                    'total_patients': result.total_patients
+                    'cosine_threshold': result['cosine_threshold'],
+                    'euclidean_threshold': result['euclidean_threshold'],
+                    'total_patients': result['total_patients']
                 }
             })
         else:
@@ -4790,6 +5561,10 @@ def train_face_model_endpoint():
 
 # Initialize the database
 init_db()
+if sms_is_configured():
+    print("[OK] SMS notifications configured")
+else:
+    print("[!] SMS notifications not configured – set Twilio env vars or a local .env file")
 
 # Main execution
 if __name__ == '__main__':
@@ -4851,7 +5626,6 @@ TOTAL USERS: 15 (1 Admin + 14 Doctors/Staff)
 ==========================================================================================''')
 
     print("=" * 60)
-    
+
     port = int(os.environ.get('PORT', 5000))
     app.run(debug=False, host='0.0.0.0', port=port, use_reloader=False)
-    

@@ -29,3 +29,11 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Local environment / generated artifacts
+.env
+*.log
+results.txt
+hospital/_probe/
+hospital/server.crt
+hospital/server.key
