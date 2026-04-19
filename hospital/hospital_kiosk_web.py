@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify, flash, redirect, url_for
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 import datetime
 import html
 import uuid
@@ -126,8 +126,20 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = 'hospital-kiosk-secret-key-2024'
 
 
+def _normalize_database_url(raw_url):
+    """Normalize database URLs that Flask-SQLAlchemy can consume."""
+    raw_url = (raw_url or '').strip()
+    if not raw_url:
+        return None
+    if raw_url.startswith('postgres://'):
+        return 'postgresql+psycopg2://' + raw_url[len('postgres://'):]
+    if raw_url.startswith('postgresql://') and '+psycopg2' not in raw_url:
+        return 'postgresql+psycopg2://' + raw_url[len('postgresql://'):]
+    return raw_url
+
+
 def _resolve_database_uri():
-    """Pick a SQLite location that is writable in the current environment."""
+    """Pick the best database backend for the current environment."""
     def _can_write_sqlite(db_file):
         probe = sqlite3.connect(db_file, timeout=2)
         try:
@@ -138,6 +150,11 @@ def _resolve_database_uri():
             return True
         finally:
             probe.close()
+
+    configured_url = _normalize_database_url(os.environ.get('DATABASE_URL'))
+    if configured_url:
+        print("[OK] Using DATABASE_URL from environment")
+        return configured_url, None, False
 
     configured_path = os.environ.get('HOSPITAL_KIOSK_DB_PATH')
     if configured_path:
@@ -172,6 +189,13 @@ app.config['SQLALCHEMY_DATABASE_URI'] = db_uri
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
+
+if USING_IN_MEMORY_DB:
+    print("[!] In-memory SQLite active; data will not survive restart")
+elif db_uri.startswith('sqlite:///'):
+    print(f"[OK] SQLite database file: {db_path}")
+else:
+    print("[OK] External database backend configured")
 
 @app.after_request
 def add_header(response):
@@ -369,9 +393,9 @@ def format_schedule_slot(patient):
 
 
 def ensure_patient_schema():
-    """Apply small SQLite schema upgrades without a migration framework."""
+    """Apply small schema upgrades without a migration framework."""
     patient_columns = {
-        row[1] for row in db.session.execute(text("PRAGMA table_info(patient)")).fetchall()
+        column['name'] for column in inspect(db.engine).get_columns('patient')
     }
     if 'consultation_date' not in patient_columns:
         db.session.execute(text("ALTER TABLE patient ADD COLUMN consultation_date DATE"))
@@ -382,19 +406,24 @@ def ensure_patient_schema():
         db.session.commit()
         print("[OK] Added patient.consultation_time column")
 
-    db.session.execute(text("""
-        UPDATE patient
-        SET consultation_date = date(check_in_time)
-        WHERE consultation_date IS NULL
-          AND check_in_time IS NOT NULL
-    """))
-    db.session.execute(text("""
-        UPDATE patient
-        SET consultation_time = time(check_in_time)
-        WHERE consultation_time IS NULL
-          AND check_in_time IS NOT NULL
-    """))
-    db.session.commit()
+    updated_rows = False
+    patients = Patient.query.filter(
+        (Patient.consultation_date.is_(None)) | (Patient.consultation_time.is_(None))
+    ).all()
+    for patient in patients:
+        if not patient.check_in_time:
+            continue
+
+        if patient.consultation_date is None:
+            patient.consultation_date = patient.check_in_time.date()
+            updated_rows = True
+
+        if patient.consultation_time is None:
+            patient.consultation_time = patient.check_in_time.time().replace(microsecond=0)
+            updated_rows = True
+
+    if updated_rows:
+        db.session.commit()
 
 
 def normalize_mobile_number(phone):
@@ -5629,3 +5658,4 @@ TOTAL USERS: 15 (1 Admin + 14 Doctors/Staff)
 
     port = int(os.environ.get('PORT', 5000))
     app.run(debug=False, host='0.0.0.0', port=port, use_reloader=False)
+    

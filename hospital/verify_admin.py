@@ -1,11 +1,6 @@
 from hospital_kiosk_web import app, db, User
-import os
 
 def verify():
-    # Force absolute path to the correct database in instance folder
-    db_path = os.path.join(app.root_path, 'instance', 'hospital_kiosk.db')
-    app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
-    
     with app.app_context():
         admin = User.query.filter_by(username='admin').first()
         if not admin:

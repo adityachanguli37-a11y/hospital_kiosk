@@ -33,7 +33,29 @@ from flask_sqlalchemy import SQLAlchemy
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-DB_PATH = 'sqlite:///' + os.path.abspath(os.path.join(os.path.dirname(__file__), 'instance', 'hospital_kiosk.db')).replace('\\\\\\\\' , '/')
+def _normalize_database_url(raw_url):
+    raw_url = (raw_url or '').strip()
+    if not raw_url:
+        return None
+    if raw_url.startswith('postgres://'):
+        return 'postgresql+psycopg2://' + raw_url[len('postgres://'):]
+    if raw_url.startswith('postgresql://') and '+psycopg2' not in raw_url:
+        return 'postgresql+psycopg2://' + raw_url[len('postgresql://'):]
+    return raw_url
+
+
+configured_url = _normalize_database_url(os.environ.get('DATABASE_URL'))
+if configured_url:
+    DB_PATH = configured_url
+else:
+    configured_path = os.environ.get('HOSPITAL_KIOSK_DB_PATH')
+    if configured_path:
+        db_file = os.path.abspath(configured_path)
+        os.makedirs(os.path.dirname(db_file) or '.', exist_ok=True)
+    else:
+        db_file = os.path.abspath(os.path.join(os.path.dirname(__file__), 'instance', 'hospital_kiosk.db'))
+    DB_PATH = 'sqlite:///' + db_file.replace('\\', '/')
+
 _app = Flask(__name__)
 _app.config['SQLALCHEMY_DATABASE_URI'] = DB_PATH
 _app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
